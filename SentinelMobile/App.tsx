@@ -8,8 +8,7 @@ import {
   TouchableOpacity,
   Platform,
   Alert,
-  ActivityIndicator,
-  Modal
+  ActivityIndicator
 } from 'react-native';
 
 interface Device {
@@ -44,22 +43,29 @@ export default function App() {
     try {
       const response = await fetch(`${BASE_URL}/api/scan`);
       const data = await response.json();
-
-      if (data.error) {
-        Alert.alert("Scan Error", data.message || "Unknown error occurred.");
-        return;
-      }
-
-      if (data.raw_output) {
-        Alert.alert("Scan Error", "Received raw output instead of JSON: " + data.raw_output);
-        return;
-      }
-
       setDevices(data.devices || []);
     } catch (error) {
-      Alert.alert("Connection Error", "Could not connect to Sentinel Agent. Check if the backend is running.");
+      Alert.alert("Error", "Could not connect to Sentinel Agent.");
     } finally {
       setLoading(false);
+    }
+  };
+
+  // 🕵️ NEW: DEEP SCAN LOGIC
+  const inspectDevice = async (ip: string) => {
+    Alert.alert("🕵️ Deep Scan Started", `Analyzing ${ip} for vulnerabilities...`);
+    try {
+      const response = await fetch(`${BASE_URL}/api/inspect?ip=${ip}`);
+      const data = await response.json();
+
+      const portList = data.open_ports.length > 0 ? data.open_ports.join(', ') : "None";
+
+      Alert.alert(
+        `🔎 Analysis Report: ${data.hostname}`,
+        `Risk Level: ${data.risk_level}\n\n🔓 Open Ports: ${portList}\n\n(Ports 22/554 are high risk!)`
+      );
+    } catch (e) {
+      Alert.alert("Error", "Deep scan failed.");
     }
   };
 
@@ -101,18 +107,19 @@ export default function App() {
 
         <FlatList
           data={devices}
-          keyExtractor={(item) => item.mac + item.ip}
           extraData={trustedMacs}
+          keyExtractor={(item) => item.mac}
           renderItem={({ item }) => {
             const name = getDeviceName(item.mac);
-            // It is trusted if it's in our list OR if it's a known router
             const isTrusted = trustedMacs.includes(item.mac) || name.includes("Router");
             const isIntruder = !isTrusted;
 
             return (
               <TouchableOpacity
-                activeOpacity={0.7}
+                activeOpacity={0.6}
                 onPress={() => toggleTrust(item.mac)}
+                onLongPress={() => inspectDevice(item.ip)}
+                delayLongPress={500}
               >
                 <View style={[styles.card, isIntruder ? styles.intruderCard : styles.safeCard]}>
                   <View style={styles.iconContainer}>
@@ -127,12 +134,8 @@ export default function App() {
                     <Text style={styles.deviceName}>{name}</Text>
                     <Text style={styles.deviceIp}>{item.ip}</Text>
                     <Text style={styles.macText}>{item.mac}</Text>
+                    {isIntruder && <Text style={styles.hintText}>Long Press to Inspect</Text>}
                   </View>
-                  {isIntruder && (
-                    <View style={styles.actionBadge}>
-                      <Text style={styles.actionText}>FIX</Text>
-                    </View>
-                  )}
                 </View>
               </TouchableOpacity>
             );
@@ -148,7 +151,7 @@ const styles = StyleSheet.create({
   header: { padding: 25, paddingTop: 60, backgroundColor: '#1C1C1E', borderBottomWidth: 1, borderBottomColor: '#2C2C2E' },
   title: { fontSize: 34, fontWeight: '900', color: '#FFFFFF', letterSpacing: 0.5 },
   subtitle: { color: '#8E8E93', marginTop: 5, fontSize: 13, fontWeight: '600', textTransform: 'uppercase' },
-  content: { padding: 20, flex: 1 },
+  content: { padding: 20 },
   scanButton: {
     backgroundColor: '#0A84FF',
     padding: 18,
@@ -182,6 +185,5 @@ const styles = StyleSheet.create({
   deviceName: { color: '#fff', fontSize: 17, fontWeight: 'bold' },
   deviceIp: { color: '#999', fontSize: 14, marginTop: 2 },
   macText: { color: '#555', fontSize: 11, marginTop: 4, fontFamily: 'monospace' },
-  actionBadge: { backgroundColor: 'rgba(255, 69, 58, 0.2)', paddingHorizontal: 10, paddingVertical: 5, borderRadius: 8 },
-  actionText: { color: '#FF453A', fontSize: 10, fontWeight: 'bold' }
+  hintText: { color: '#FF453A', fontSize: 10, marginTop: 5, fontStyle: 'italic', opacity: 0.8 }
 });
