@@ -109,13 +109,17 @@ export default function App() {
   const toggleTrust = async (mac: string) => {
     let newTrusted;
     if (trustedMacs.includes(mac)) {
-      newTrusted = trustedMacs.filter(id => id !== mac); // Untrust
+      newTrusted = trustedMacs.filter(id => id !== mac);
     } else {
       newTrusted = [...trustedMacs, mac];
     }
 
     setTrustedMacs(newTrusted);
-    await AsyncStorage.setItem('trusted_macs', JSON.stringify(newTrusted));
+    try {
+      await AsyncStorage.setItem('trusted_macs', JSON.stringify(newTrusted));
+    } catch (e) {
+      console.error("Failed to save trusted devices");
+    }
   };
 
   // 📄 REPORT GENERATION

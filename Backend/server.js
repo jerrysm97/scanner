@@ -115,4 +115,5 @@ app.get('/api/honeypot', (req, res) => {
 const PORT = 3000;
 app.listen(PORT, () => {
     console.log(`🚀 Sentinel Bridge running on http://localhost:${PORT}`);
+    console.log(`💡 NOTE: Run with 'sudo node server.js' for Active Scanning features.`);
 });

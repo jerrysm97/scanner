@@ -1,21 +1,40 @@
 #!/usr/bin/env python3
+import sys
+import json
+import socket
+import logging
+import concurrent.futures
+import platform
 import subprocess
 import re
-import json
-import sys
-import socket
-import platform
 import urllib.request
 import base64
 import urllib.error
-
 from scapy.all import ARP, Ether, srp
 
-def scan_network(target_ip="192.168.1.0/24"):
+# Suppress Scapy warnings to keep JSON output clean
+logging.getLogger("scapy.runtime").setLevel(logging.ERROR)
+
+def get_local_ip_range():
+    """Auto-detects local IP and subnet (e.g., 192.168.1.0/24)"""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        # Doesn't need to connect, just needs to pick an interface
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return f"{ip.rsplit('.', 1)[0]}.0/24"
+    except:
+        return "192.168.1.0/24" # Fallback
+
+def scan_network():
+    """ 
+    GAP FIX: Active ARP Scan 
+    Sends 'Who is here?' packets to the whole network.
+    Falls back to passive scan if non-root.
     """
-    Active ARP Scan using Scapy.
-    Falls back to passive 'arp -a' if active scan fails (e.g. no root).
-    """
+    target_ip = get_local_ip_range()
+    
     try:
         # 1. Try Active ARP Request
         arp = ARP(pdst=target_ip)
@@ -33,7 +52,7 @@ def scan_network(target_ip="192.168.1.0/24"):
         return devices
 
     except Exception as active_err:
-        # Fallback to passive ARP scan if active fails
+        # Fallback to passive ARP scan if active fails (e.g. no root)
         try:
             os_type = platform.system()
             args = ["arp", "-a"]
@@ -64,47 +83,58 @@ def scan_network(target_ip="192.168.1.0/24"):
         except Exception as passive_err:
             return {"error": f"Active scan failed ({str(active_err)}) and Passive scan failed ({str(passive_err)})"}
 
+def check_port(ip, port):
+    """Helper for multithreading port scan"""
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(0.5)
+        result = sock.connect_ex((ip, port))
+        sock.close()
+        if result == 0:
+            return port
+    except:
+        pass
+    return None
+
 def deep_scan(target_ip):
-    """ Checks for common open ports and hostname """
+    """
+    GAP FIX: Multithreaded Port Scanner
+    Scans common ports in parallel for speed.
+    """
     # 1. Get Hostname
     try:
         hostname = socket.gethostbyaddr(target_ip)[0]
     except socket.herror:
         hostname = "Unknown Hostname"
     
-    # 2. Scan Common Ports
+    # 2. Parallel Port Scan
+    # Added common industrial and management ports
+    common_ports = [21, 22, 23, 53, 80, 135, 139, 443, 445, 502, 554, 3389, 8080]
     open_ports = []
-    # Ports: FTP, SSH, DNS, HTTP, HTTPS, Modbus, RTSP, Alt-HTTP
-    common_ports = [21, 22, 53, 80, 443, 502, 554, 8080]
-   
-    for port in common_ports:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(0.3) # Fast timeout
-        result = sock.connect_ex((target_ip, port))
-        if result == 0:
-            open_ports.append(port)
-        sock.close()
+    
+    # Scan using 15 threads for high speed
+    with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
+        future_to_port = {executor.submit(check_port, target_ip, p): p for p in common_ports}
+        for future in concurrent.futures.as_completed(future_to_port):
+            p = future.result()
+            if p:
+                open_ports.append(p)
         
     return {
         "ip": target_ip,
         "hostname": hostname,
-        "open_ports": open_ports,
-        "risk_level": "HIGH" if (22 in open_ports or 554 in open_ports) else "LOW"
+        "open_ports": sorted(open_ports),
+        "risk_level": "HIGH" if (22 in open_ports or 23 in open_ports or 554 in open_ports) else "LOW"
     }
 
 def audit_credentials(target_ip):
-    """ 
-    Vulnerability Scanner: Checks for weak 'admin:admin' credentials 
-    Returns: {"status": "VULNERABLE"} or {"status": "SECURE"}
-    """
+    """ Vulnerability Scanner: Checks for weak 'admin:admin' credentials """
     url = f"http://{target_ip}"
-    # Create Basic Auth Header for "admin:admin"
     credentials = base64.b64encode(b"admin:admin").decode("utf-8")
     headers = {"Authorization": f"Basic {credentials}"}
     
     try:
         req = urllib.request.Request(url, headers=headers)
-        # Timeout is 1 second as requested
         with urllib.request.urlopen(req, timeout=1) as response:
             if response.getcode() == 200:
                 return {"status": "VULNERABLE", "risk": "CRITICAL", "message": "Default credentials (admin:admin) accepted!"}
@@ -112,39 +142,28 @@ def audit_credentials(target_ip):
         if e.code == 401:
             return {"status": "SECURE", "risk": "LOW", "message": "Device is password protected."}
     except Exception as e:
-        # Connection failed or other error - consider it secure/unreachable for this specific test
         return {"status": "SECURE", "risk": "LOW", "message": f"Connection failed/Auth not requested: {str(e)}"}
     
-    return {"status": "SECURE", "risk": "LOW", "message": "No login form or auth required."}
+    return {"status": "SECURE", "risk": "LOW", "message": "No login form found."}
 
 if __name__ == "__main__":
     if len(sys.argv) > 1:
-        first_arg = sys.argv[1]
+        cmd = sys.argv[1]
         
-        if first_arg == "audit":
+        if cmd == "audit":
             # Usage: python3 agent.py audit <IP>
             if len(sys.argv) > 2:
-                target_ip = sys.argv[2]
-                print(json.dumps(audit_credentials(target_ip)))
+                print(json.dumps(audit_credentials(sys.argv[2])))
             else:
-                 print(json.dumps({"error": "Missing IP for audit"}))
+                 print(json.dumps({"error": "Missing IP"}))
         else:
-            # Usage: python3 agent.py <IP>  (Deep Scan)
-            print(json.dumps(deep_scan(first_arg)))
+            # Usage: python3 agent.py <IP> (Deep Scan)
+            print(json.dumps(deep_scan(cmd)))
     else:
         # Usage: python3 agent.py (Discovery)
         found_devices = scan_network()
         if isinstance(found_devices, dict) and "error" in found_devices:
-             results = {
-                "status": "error",
-                "message": found_devices["error"],
-                "count": 0,
-                "devices": []
-            }
+             results = {"status": "error", "message": found_devices["error"], "devices": []}
         else:
-            results = {
-                "status": "success",
-                "count": len(found_devices),
-                "devices": found_devices
-            }
+            results = {"status": "success", "count": len(found_devices), "devices": found_devices}
         print(json.dumps(results))
