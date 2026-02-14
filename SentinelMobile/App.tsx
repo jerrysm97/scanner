@@ -1,17 +1,17 @@
 /**
  * ═══════════════════════════════════════════════════════════════════════════════
- *  Sentinel Mobile v3.0 — Production-Ready React Native App
+ *  Sentinel Mobile v4.0 — Enterprise-Grade React Native App
  * ═══════════════════════════════════════════════════════════════════════════════
  *
  *  Features:
- *  ► Physical device support (connects via LAN IP)
+ *  ► Physical device support via LAN IP
+ *  ► Database status indicator (total devices logged in Supabase)
  *  ► AsyncStorage persistence for trusted devices
- *  ► Network scanning with device classification
- *  ► Deep scan (long-press any device)
- *  ► Credential audit (tap 🔐 on intruder cards)
+ *  ► Long-press device card → Credential Audit
  *  ► Honeypot intrusion detection (polls every 10s)
- *  ► Security report sharing (via Share API)
- *  ► Dark theme with animated UI
+ *  ► Deep scan via swipe/tap
+ *  ► Security report sharing
+ *  ► Professional dark mode theme
  */
 
 import React, { useState, useEffect, useCallback, useRef } from 'react';
@@ -43,6 +43,7 @@ interface Device {
   status?: string;
   risk?: string;
   scan_mode?: string;
+  last_seen?: string;
 }
 
 interface HoneypotLog {
@@ -50,14 +51,6 @@ interface HoneypotLog {
   timestamp: string;
   port: number;
   message: string;
-}
-
-interface DeepScanResult {
-  ip: string;
-  hostname: string;
-  open_ports: { port: number; banner: string }[];
-  port_count: number;
-  risk_level: string;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -69,8 +62,6 @@ const STORAGE_KEYS = {
   LAST_SCAN: '@sentinel_last_scan',
   DEVICES: '@sentinel_devices',
 };
-
-const HONEYPOT_POLL_INTERVAL = 10000; // 10 seconds
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  APP COMPONENT
@@ -84,59 +75,68 @@ export default function App() {
   const [lastScanTime, setLastScanTime] = useState<string | null>(null);
   const [scanMode, setScanMode] = useState<string>('—');
   const [subnet, setSubnet] = useState<string>('—');
+  const [dbTotal, setDbTotal] = useState<number>(0);
+  const [dbConnected, setDbConnected] = useState<boolean>(false);
 
-  // Banner animation
   const bannerAnim = useRef(new Animated.Value(0)).current;
 
   // ── Connection ──────────────────────────────────────────────────────────────
-  // Use your computer's LAN IP so physical phones can reach the backend.
-  // Emulator uses 10.0.2.2 to reach the host machine.
-  const BASE_URL = Platform.OS === 'android'
-    ? __DEV__
-      ? 'http://192.168.1.103:3000'   // Physical phone or emulator on same LAN
-      : 'http://192.168.1.103:3000'
-    : 'http://localhost:3000';
+  // IMPORTANT: Replace with YOUR computer's local IP address.
+  // Find it: macOS → System Settings → Wi-Fi → Details → IP Address
+  //          Windows → ipconfig → IPv4 Address
+  const BASE_URL = 'http://192.168.1.103:3000';
 
-  // ── Load persisted data on startup ──────────────────────────────────────────
+  // ── Load Persisted Data ─────────────────────────────────────────────────────
   useEffect(() => {
-    const loadPersistedData = async () => {
+    const load = async () => {
       try {
-        const [storedMacs, storedTime, storedDevices] = await Promise.all([
+        const [macs, time, devs] = await Promise.all([
           AsyncStorage.getItem(STORAGE_KEYS.TRUSTED_MACS),
           AsyncStorage.getItem(STORAGE_KEYS.LAST_SCAN),
           AsyncStorage.getItem(STORAGE_KEYS.DEVICES),
         ]);
-        if (storedMacs) setTrustedMacs(JSON.parse(storedMacs));
-        if (storedTime) setLastScanTime(storedTime);
-        if (storedDevices) setDevices(JSON.parse(storedDevices));
+        if (macs) setTrustedMacs(JSON.parse(macs));
+        if (time) setLastScanTime(time);
+        if (devs) setDevices(JSON.parse(devs));
       } catch (e) {
-        console.error('Failed to load persisted data:', e);
+        console.error('Load error:', e);
       }
     };
-    loadPersistedData();
+    load();
   }, []);
 
-  // ── Honeypot Polling — every 10 seconds ─────────────────────────────────────
+  // ── Honeypot Polling (every 10s) ────────────────────────────────────────────
   useEffect(() => {
-    const pollHoneypot = async () => {
+    const poll = async () => {
       try {
         const resp = await fetch(`${BASE_URL}/api/honeypot`);
         const logs: HoneypotLog[] = await resp.json();
         setHoneypotLogs(logs);
-
-        // Animate banner in/out
         Animated.timing(bannerAnim, {
           toValue: logs.length > 0 ? 1 : 0,
           duration: 300,
           useNativeDriver: false,
         }).start();
-      } catch {
-        // Server not reachable — ignore
-      }
+      } catch { /* server unreachable */ }
     };
 
-    pollHoneypot(); // Immediate first poll
-    const interval = setInterval(pollHoneypot, HONEYPOT_POLL_INTERVAL);
+    poll();
+    const interval = setInterval(poll, 10000);
+    return () => clearInterval(interval);
+  }, [BASE_URL]);
+
+  // ── Check Database Status on Mount ──────────────────────────────────────────
+  useEffect(() => {
+    const checkStatus = async () => {
+      try {
+        const resp = await fetch(`${BASE_URL}/api/status`);
+        const data = await resp.json();
+        setDbConnected(data.supabase_connected || false);
+        setDbTotal(data.total_devices_logged || 0);
+      } catch { /* ignore */ }
+    };
+    checkStatus();
+    const interval = setInterval(checkStatus, 30000);
     return () => clearInterval(interval);
   }, [BASE_URL]);
 
@@ -152,10 +152,14 @@ export default function App() {
         setScanMode(data.scan_mode || 'passive');
         setSubnet(data.subnet || '—');
 
+        // Database info
+        if (data.database) {
+          setDbTotal(data.database.total_logged || 0);
+        }
+
         const now = new Date().toLocaleTimeString();
         setLastScanTime(now);
 
-        // Persist scan results
         await Promise.all([
           AsyncStorage.setItem(STORAGE_KEYS.LAST_SCAN, now),
           AsyncStorage.setItem(STORAGE_KEYS.DEVICES, JSON.stringify(data.devices)),
@@ -166,42 +170,44 @@ export default function App() {
     } catch (error: any) {
       Alert.alert(
         '⚠️ Connection Error',
-        `Cannot reach the Sentinel server at:\n${BASE_URL}\n\nMake sure:\n1. Backend is running (node server.js)\n2. Phone and computer are on the same WiFi\n3. IP address is correct`
+        `Cannot reach server at:\n${BASE_URL}\n\n` +
+        `Make sure:\n` +
+        `1. Backend is running (node server.js)\n` +
+        `2. Phone & computer on same WiFi\n` +
+        `3. IP address is correct`
       );
     } finally {
       setLoading(false);
     }
   }, [BASE_URL]);
 
-  // ── Deep Scan (long-press) ──────────────────────────────────────────────────
+  // ── Deep Scan ───────────────────────────────────────────────────────────────
   const deepScan = useCallback(async (ip: string) => {
-    Alert.alert('🔍 Deep Scan', `Scanning ${ip}...\nThis may take a few seconds.`);
-
     try {
       const response = await fetch(`${BASE_URL}/api/inspect?ip=${ip}`);
-      const data: DeepScanResult = await response.json();
+      const data = await response.json();
 
       if (data.error) {
-        Alert.alert('Scan Error', data.error);
+        Alert.alert('Error', data.error);
         return;
       }
 
       const portList = data.open_ports?.length > 0
-        ? data.open_ports.map(p => `  • Port ${p.port}${p.banner ? ` — ${p.banner}` : ''}`).join('\n')
+        ? data.open_ports.map((p: any) => `  • Port ${p.port}${p.banner ? ` — ${p.banner}` : ''}`).join('\n')
         : '  None found';
 
       Alert.alert(
         `🔍 Deep Scan: ${ip}`,
         `Hostname: ${data.hostname}\n` +
         `Open Ports (${data.port_count}):\n${portList}\n\n` +
-        `Risk Level: ${riskEmoji(data.risk_level)} ${data.risk_level}`
+        `Risk Level: ${data.risk_level}`
       );
     } catch {
-      Alert.alert('Error', 'Deep scan failed. Is the server running?');
+      Alert.alert('Error', 'Deep scan failed.');
     }
   }, [BASE_URL]);
 
-  // ── Credential Audit (tap 🔐) ──────────────────────────────────────────────
+  // ── Credential Audit (LONG PRESS) ──────────────────────────────────────────
   const auditCredentials = useCallback(async (ip: string) => {
     Alert.alert('🔐 Auditing', `Checking default credentials on ${ip}...`);
 
@@ -226,7 +232,7 @@ export default function App() {
         );
       }
     } catch {
-      Alert.alert('Error', 'Credential audit failed. Is the server running?');
+      Alert.alert('Error', 'Credential audit failed.');
     }
   }, [BASE_URL]);
 
@@ -241,63 +247,43 @@ export default function App() {
     try {
       await AsyncStorage.setItem(STORAGE_KEYS.TRUSTED_MACS, JSON.stringify(updated));
     } catch (e) {
-      console.error('Failed to save trusted devices:', e);
+      console.error('Save error:', e);
     }
   }, [trustedMacs]);
 
-  // ── Generate Security Report ────────────────────────────────────────────────
+  // ── Report ──────────────────────────────────────────────────────────────────
   const generateReport = useCallback(async () => {
     const trusted = devices.filter(d => trustedMacs.includes(d.mac));
     const intruders = devices.filter(d => !trustedMacs.includes(d.mac));
 
     const report = [
-      `══════════════════════════════════════`,
-      `   🛡️ SENTINEL SECURITY REPORT`,
-      `══════════════════════════════════════`,
-      `📅 Generated: ${new Date().toLocaleString()}`,
-      `📡 Subnet: ${subnet}`,
-      `🔍 Scan Mode: ${scanMode}`,
-      `📊 Total Devices: ${devices.length}`,
-      `✅ Trusted: ${trusted.length}`,
-      `⚠️ Untrusted: ${intruders.length}`,
+      `═══════════════════════════════════`,
+      `  🛡️ SENTINEL SECURITY REPORT`,
+      `═══════════════════════════════════`,
+      `📅 ${new Date().toLocaleString()}`,
+      `📡 Subnet: ${subnet}  |  Mode: ${scanMode}`,
+      `📊 Total: ${devices.length}  |  DB Logged: ${dbTotal}`,
+      `✅ Trusted: ${trusted.length}  |  ⚠️ Untrusted: ${intruders.length}`,
       `🪤 Honeypot Triggers: ${honeypotLogs.length}`,
       ``,
-      `── Trusted Devices ─────────────────`,
-      ...trusted.map(d => `  ✅ ${d.ip} | ${d.mac} | ${d.vendor || 'Unknown'}`),
+      `── Trusted ─────────────────────`,
+      ...trusted.map(d => `  ✅ ${d.ip} | ${d.mac} | ${d.vendor || '?'}`),
       ``,
-      `── Untrusted Devices ───────────────`,
-      ...intruders.map(d => `  ⚠️ ${d.ip} | ${d.mac} | ${d.vendor || 'Unknown'}`),
+      `── Untrusted ───────────────────`,
+      ...intruders.map(d => `  ⚠️ ${d.ip} | ${d.mac} | ${d.vendor || '?'}`),
     ];
 
     if (honeypotLogs.length > 0) {
-      report.push(``, `── Honeypot Intrusions ─────────────`);
-      honeypotLogs.forEach(log => {
-        report.push(`  🪤 ${log.ip} at ${log.timestamp}`);
-      });
+      report.push(``, `── Honeypot ────────────────────`);
+      honeypotLogs.forEach(l => report.push(`  🪤 ${l.ip} at ${l.timestamp}`));
     }
-
-    report.push(``, `══════════════════════════════════════`);
 
     try {
-      await Share.share({
-        message: report.join('\n'),
-        title: 'Sentinel Security Report',
-      });
-    } catch {
-      Alert.alert('Error', 'Failed to share report.');
-    }
-  }, [devices, trustedMacs, honeypotLogs, subnet, scanMode]);
+      await Share.share({ message: report.join('\n'), title: 'Sentinel Report' });
+    } catch { /* ignore */ }
+  }, [devices, trustedMacs, honeypotLogs, subnet, scanMode, dbTotal]);
 
-  // ── Helpers ─────────────────────────────────────────────────────────────────
-  const riskEmoji = (level: string) => {
-    switch (level?.toUpperCase()) {
-      case 'CRITICAL': return '🔴';
-      case 'HIGH': return '🟠';
-      case 'MEDIUM': return '🟡';
-      default: return '🟢';
-    }
-  };
-
+  // ── Emoji Helpers ───────────────────────────────────────────────────────────
   const typeEmoji = (type: string) => {
     if (!type) return '📱';
     const t = type.toLowerCase();
@@ -318,58 +304,42 @@ export default function App() {
   // ── Render Device Card ──────────────────────────────────────────────────────
   const renderDevice = ({ item }: { item: Device }) => {
     const isTrusted = trustedMacs.includes(item.mac);
-    const isIntruder = !isTrusted && devices.length > 0;
 
     return (
       <TouchableOpacity
-        style={[
-          styles.card,
-          isTrusted ? styles.trustedCard : styles.intruderCard,
-        ]}
-        onLongPress={() => deepScan(item.ip)}
+        style={[styles.card, isTrusted ? styles.trustedCard : styles.intruderCard]}
+        onPress={() => deepScan(item.ip)}
+        onLongPress={() => auditCredentials(item.ip)}
+        delayLongPress={600}
         activeOpacity={0.7}
       >
-        {/* Header */}
+        {/* Header Row */}
         <View style={styles.cardHeader}>
           <Text style={styles.cardEmoji}>{typeEmoji(item.type || '')}</Text>
           <View style={styles.cardInfo}>
             <Text style={styles.cardIP}>{item.ip}</Text>
             <Text style={styles.cardType}>{item.type || 'Unknown Device'}</Text>
           </View>
-          <View style={styles.cardActions}>
-            {/* Credential Audit Button (only for non-trusted) */}
-            {isIntruder && (
-              <TouchableOpacity
-                style={styles.auditBtn}
-                onPress={() => auditCredentials(item.ip)}
-              >
-                <Text style={styles.auditBtnText}>🔐</Text>
-              </TouchableOpacity>
-            )}
-            {/* Trust Toggle */}
-            <TouchableOpacity
-              style={[styles.trustBtn, isTrusted ? styles.trustedBtn : styles.untrustedBtn]}
-              onPress={() => toggleTrust(item.mac)}
-            >
-              <Text style={styles.trustBtnText}>
-                {isTrusted ? '✅' : '❌'}
-              </Text>
-            </TouchableOpacity>
-          </View>
+          <TouchableOpacity
+            style={[styles.trustBtn, isTrusted ? styles.trustedBtn : styles.untrustedBtn]}
+            onPress={() => toggleTrust(item.mac)}
+          >
+            <Text style={styles.trustBtnText}>{isTrusted ? '✅' : '❌'}</Text>
+          </TouchableOpacity>
         </View>
 
         {/* Details */}
         <View style={styles.cardDetails}>
-          <Text style={styles.cardMAC}>MAC: {item.mac}</Text>
+          <Text style={styles.cardMAC}>{item.mac}</Text>
           <Text style={styles.cardVendor}>{item.vendor || 'Unknown vendor'}</Text>
         </View>
 
-        {/* Status Bar */}
-        <View style={styles.cardStatus}>
-          <Text style={[styles.statusBadge, isTrusted ? styles.trustedBadge : styles.intruderBadge]}>
+        {/* Footer */}
+        <View style={styles.cardFooter}>
+          <Text style={[styles.badge, isTrusted ? styles.trustedBadge : styles.intruderBadge]}>
             {isTrusted ? '✅ TRUSTED' : '⚠️ INTRUDER'}
           </Text>
-          <Text style={styles.cardHint}>Long press → Deep Scan</Text>
+          <Text style={styles.hintText}>Tap → Scan  |  Hold → Audit 🔐</Text>
         </View>
       </TouchableOpacity>
     );
@@ -378,24 +348,34 @@ export default function App() {
   // ── Main Render ─────────────────────────────────────────────────────────────
   const bannerHeight = bannerAnim.interpolate({
     inputRange: [0, 1],
-    outputRange: [0, 60],
+    outputRange: [0, 56],
   });
 
   return (
     <SafeAreaView style={styles.container}>
-      <StatusBar barStyle="light-content" backgroundColor="#0a0a0a" />
+      <StatusBar barStyle="light-content" backgroundColor="#050505" />
 
-      {/* ── Honeypot Intrusion Banner ── */}
+      {/* ── Honeypot Alert Banner ── */}
       <Animated.View style={[styles.intrusionBanner, { height: bannerHeight, opacity: bannerAnim }]}>
         <Text style={styles.intrusionText}>
-          🚨 INTRUSION DETECTED — {honeypotLogs.length} connection(s) on honeypot!
+          🚨 INTRUSION DETECTED — {honeypotLogs.length} connection(s) on honeypot
         </Text>
       </Animated.View>
 
       {/* ── Header ── */}
       <View style={styles.header}>
-        <Text style={styles.title}>🛡️ SENTINEL</Text>
-        <Text style={styles.subtitle}>Network Security Monitor v3.0</Text>
+        <View style={styles.titleRow}>
+          <View>
+            <Text style={styles.title}>🛡️ SENTINEL</Text>
+            <Text style={styles.subtitle}>Enterprise Security Monitor v4.0</Text>
+          </View>
+          {/* Database Status Indicator */}
+          <View style={styles.dbStatus}>
+            <View style={[styles.dbDot, dbConnected ? styles.dbDotOn : styles.dbDotOff]} />
+            <Text style={styles.dbText}>DB: {dbTotal}</Text>
+          </View>
+        </View>
+
         <View style={styles.statsRow}>
           <Text style={styles.stat}>📡 {subnet}</Text>
           <Text style={styles.stat}>🔍 {scanMode}</Text>
@@ -422,8 +402,8 @@ export default function App() {
         ListEmptyComponent={
           <View style={styles.emptyState}>
             <Text style={styles.emptyEmoji}>📡</Text>
-            <Text style={styles.emptyText}>No devices scanned yet.</Text>
-            <Text style={styles.emptyHint}>Tap "SCAN NETWORK" to begin.</Text>
+            <Text style={styles.emptyTitle}>No Devices Scanned</Text>
+            <Text style={styles.emptyHint}>Tap "SCAN NETWORK" to discover devices</Text>
           </View>
         }
       />
@@ -436,7 +416,7 @@ export default function App() {
           disabled={loading}
         >
           {loading ? (
-            <ActivityIndicator color="#fff" size="small" />
+            <ActivityIndicator color="#000" size="small" />
           ) : (
             <Text style={styles.scanBtnText}>📡 SCAN NETWORK</Text>
           )}
@@ -447,7 +427,7 @@ export default function App() {
           onPress={generateReport}
           disabled={devices.length === 0}
         >
-          <Text style={styles.reportBtnText}>📋 REPORT</Text>
+          <Text style={styles.reportBtnText}>📋</Text>
         </TouchableOpacity>
       </View>
     </SafeAreaView>
@@ -455,13 +435,13 @@ export default function App() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-//  STYLES
+//  STYLES — Professional Dark Mode
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    backgroundColor: '#0a0a0a',
+    backgroundColor: '#050505',
   },
 
   // ── Intrusion Banner ──
@@ -473,29 +453,63 @@ const styles = StyleSheet.create({
   },
   intrusionText: {
     color: '#fff',
-    fontSize: 14,
+    fontSize: 13,
     fontWeight: '800',
     letterSpacing: 0.5,
   },
 
   // ── Header ──
   header: {
-    padding: 20,
+    paddingHorizontal: 20,
+    paddingTop: 16,
     paddingBottom: 12,
     borderBottomWidth: 1,
-    borderBottomColor: '#1a1a1a',
+    borderBottomColor: '#151515',
+  },
+  titleRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'flex-start',
   },
   title: {
-    fontSize: 28,
+    fontSize: 26,
     fontWeight: '900',
     color: '#00ff88',
     letterSpacing: 2,
   },
   subtitle: {
-    fontSize: 13,
-    color: '#666',
+    fontSize: 11,
+    color: '#555',
     marginTop: 2,
     letterSpacing: 0.5,
+  },
+  dbStatus: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#111',
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#222',
+  },
+  dbDot: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+    marginRight: 6,
+  },
+  dbDotOn: {
+    backgroundColor: '#00ff88',
+  },
+  dbDotOff: {
+    backgroundColor: '#ff4444',
+  },
+  dbText: {
+    color: '#888',
+    fontSize: 12,
+    fontWeight: '600',
+    fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
   },
   statsRow: {
     flexDirection: 'row',
@@ -503,8 +517,8 @@ const styles = StyleSheet.create({
     marginTop: 8,
   },
   stat: {
-    fontSize: 12,
-    color: '#888',
+    fontSize: 11,
+    color: '#666',
   },
 
   // ── Device List ──
@@ -521,19 +535,19 @@ const styles = StyleSheet.create({
     borderWidth: 1,
   },
   trustedCard: {
-    backgroundColor: '#0d1f12',
-    borderColor: '#1a3d20',
+    backgroundColor: '#0a1a0f',
+    borderColor: '#153d20',
   },
   intruderCard: {
-    backgroundColor: '#1f0d0d',
-    borderColor: '#3d1a1a',
+    backgroundColor: '#1a0a0a',
+    borderColor: '#3d1515',
   },
   cardHeader: {
     flexDirection: 'row',
     alignItems: 'center',
   },
   cardEmoji: {
-    fontSize: 28,
+    fontSize: 26,
     marginRight: 12,
   },
   cardInfo: {
@@ -542,27 +556,13 @@ const styles = StyleSheet.create({
   cardIP: {
     fontSize: 16,
     fontWeight: '700',
-    color: '#fff',
+    color: '#eee',
     fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
   },
   cardType: {
-    fontSize: 12,
-    color: '#aaa',
+    fontSize: 11,
+    color: '#888',
     marginTop: 2,
-  },
-  cardActions: {
-    flexDirection: 'row',
-    gap: 8,
-  },
-  auditBtn: {
-    padding: 8,
-    borderRadius: 8,
-    backgroundColor: '#2a1a00',
-    borderWidth: 1,
-    borderColor: '#4a3000',
-  },
-  auditBtnText: {
-    fontSize: 18,
   },
   trustBtn: {
     padding: 8,
@@ -570,12 +570,12 @@ const styles = StyleSheet.create({
     borderWidth: 1,
   },
   trustedBtn: {
-    backgroundColor: '#0d2818',
+    backgroundColor: '#0a2818',
     borderColor: '#1a5030',
   },
   untrustedBtn: {
-    backgroundColor: '#280d0d',
-    borderColor: '#501a1a',
+    backgroundColor: '#280a0a',
+    borderColor: '#501515',
   },
   trustBtnText: {
     fontSize: 18,
@@ -584,26 +584,26 @@ const styles = StyleSheet.create({
     marginTop: 8,
     paddingTop: 8,
     borderTopWidth: 1,
-    borderTopColor: '#1a1a1a',
+    borderTopColor: '#151515',
   },
   cardMAC: {
-    fontSize: 11,
-    color: '#666',
+    fontSize: 10,
+    color: '#555',
     fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
   },
   cardVendor: {
-    fontSize: 11,
-    color: '#888',
+    fontSize: 10,
+    color: '#777',
     marginTop: 2,
   },
-  cardStatus: {
+  cardFooter: {
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
     marginTop: 8,
   },
-  statusBadge: {
-    fontSize: 11,
+  badge: {
+    fontSize: 10,
     fontWeight: '700',
     paddingHorizontal: 8,
     paddingVertical: 3,
@@ -618,9 +618,9 @@ const styles = StyleSheet.create({
     color: '#ff4444',
     backgroundColor: '#2a0a0a',
   },
-  cardHint: {
-    fontSize: 10,
-    color: '#444',
+  hintText: {
+    fontSize: 9,
+    color: '#333',
     fontStyle: 'italic',
   },
 
@@ -633,13 +633,14 @@ const styles = StyleSheet.create({
     fontSize: 48,
     marginBottom: 12,
   },
-  emptyText: {
-    color: '#666',
+  emptyTitle: {
+    color: '#555',
     fontSize: 16,
+    fontWeight: '600',
   },
   emptyHint: {
-    color: '#444',
-    fontSize: 13,
+    color: '#333',
+    fontSize: 12,
     marginTop: 4,
   },
 
@@ -649,38 +650,36 @@ const styles = StyleSheet.create({
     padding: 16,
     paddingBottom: Platform.OS === 'ios' ? 30 : 16,
     gap: 10,
-    backgroundColor: '#0a0a0a',
+    backgroundColor: '#050505',
     borderTopWidth: 1,
-    borderTopColor: '#1a1a1a',
+    borderTopColor: '#151515',
   },
   scanBtn: {
-    flex: 2,
+    flex: 1,
     backgroundColor: '#00cc66',
     paddingVertical: 14,
     borderRadius: 10,
     alignItems: 'center',
   },
   scanBtnDisabled: {
-    backgroundColor: '#004422',
+    backgroundColor: '#003d1f',
   },
   scanBtnText: {
     color: '#000',
-    fontSize: 16,
+    fontSize: 15,
     fontWeight: '800',
     letterSpacing: 1,
   },
   reportBtn: {
-    flex: 1,
-    backgroundColor: '#1a1a2e',
+    width: 52,
+    backgroundColor: '#111',
     paddingVertical: 14,
     borderRadius: 10,
     alignItems: 'center',
     borderWidth: 1,
-    borderColor: '#2a2a4e',
+    borderColor: '#222',
   },
   reportBtnText: {
-    color: '#aaa',
-    fontSize: 14,
-    fontWeight: '700',
+    fontSize: 20,
   },
 });
