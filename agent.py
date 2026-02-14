@@ -63,6 +63,7 @@ class NetworkScanner:
     SOCKET_TIMEOUT: float = 0.5       # Hard cap per port probe
     ARP_TIMEOUT: int = 15             # Max wait for 'arp -a'
     MAX_PORT_WORKERS: int = 20        # Thread pool size for port scanning
+    MAX_PING_WORKERS: int = 50        # Thread pool size for discovery ping sweep
 
     # Default credentials to test (username, password)
     DEFAULT_CREDENTIALS: List[Tuple[str, str]] = [
@@ -136,10 +137,17 @@ class NetworkScanner:
         """
         try:
             if self._os_type == "Darwin":
-                return subprocess.check_output(
-                    ["ipconfig", "getifaddr", "en0"],
-                    stderr=subprocess.DEVNULL, timeout=5
-                ).decode().strip()
+                # Try common interfaces en0 (standard wifi), en1, en2 (dongles)
+                for iface in ["en0", "en1", "en2", "en3"]:
+                    try:
+                        res = subprocess.check_output(
+                            ["ipconfig", "getifaddr", iface],
+                            stderr=subprocess.DEVNULL, timeout=2
+                        ).decode().strip()
+                        if res: return res
+                    except Exception:
+                        continue
+                return "127.0.0.1"
             elif self._os_type == "Linux":
                 output = subprocess.check_output(
                     ["hostname", "-I"],
@@ -159,7 +167,32 @@ class NetworkScanner:
     def _get_subnet(self) -> str:
         """Return the /24 subnet string from local IP."""
         ip = self._get_local_ip()
-        return f"{ip.rsplit('.', 1)[0]}.0/24"
+        return ".".join(ip.split(".")[:3])
+
+    def _ping_host(self, ip: str) -> None:
+        """
+        Send a single ping to a host to populate the ARP cache.
+        We don't care about the result, just that the OS does an ARP request.
+        """
+        try:
+            if self._os_type == "Windows":
+                subprocess.run(["ping", "-n", "1", "-w", "100", ip], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            else:
+                subprocess.run(["ping", "-c", "1", "-W", "1", ip], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+
+    def _ping_sweep(self) -> None:
+        """
+        Populate the ARP cache by pinging all 254 addresses in the /24 subnet.
+        Uses a thread pool for speed.
+        """
+        subnet = self._get_subnet()
+        self._log(f"⚡ Performing ping sweep on {subnet}.0/24...")
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=self.MAX_PING_WORKERS) as executor:
+            futures = [executor.submit(self._ping_host, f"{subnet}.{i}") for i in range(1, 255)]
+            concurrent.futures.wait(futures)
 
     # ═══════════════════════════════════════════════════════════════════════════
     #  NETWORK DISCOVERY — Cross-Platform ARP Parsing
@@ -167,22 +200,14 @@ class NetworkScanner:
 
     def scan(self) -> dict:
         """
-        Discover all devices on the local network via 'arp -a'.
-
-        ARP output formats by OS:
-            Windows:  192.168.1.1     aa-bb-cc-dd-ee-ff     dynamic
-            macOS:    ? (192.168.1.1) at aa:bb:cc:dd:ee:ff on en0 ...
-            Linux:    ? (192.168.1.1) at aa:bb:cc:dd:ee:ff [ether] on eth0
-
-        Edge cases handled:
-            - 'arp' command not found      → returns error status
-            - Command times out            → returns timeout status
-            - Empty output                 → returns empty device list
-            - Duplicate MACs               → deduplicated via set()
-            - "incomplete" ARP entries     → filtered out
-            - Broadcast ff:ff:ff:ff:ff:ff  → filtered out
+        Discover all devices on the local network.
+        First performs a quick ping sweep to populate the ARP cache, 
+        then parses 'arp -a'.
         """
-        self._log("📡 Starting network discovery scan...")
+        # Active discovery: populate ARP cache
+        self._ping_sweep()
+        
+        self._log("📡 Scanning ARP cache for devices...")
 
         try:
             raw_output = subprocess.check_output(
@@ -237,17 +262,10 @@ class NetworkScanner:
     def _parse_arp_line(self, line: str) -> Optional[Tuple[str, str]]:
         """
         Parse a single line of ARP output into (ip, mac).
-
-        Returns None if:
-            - Line doesn't match any known ARP format
-            - Entry contains "incomplete" (no MAC resolved)
-            - MAC is broadcast (ff:ff:ff:ff:ff:ff)
-            - MAC is all zeros (00:00:00:00:00:00)
-
-        Windows uses dashes (aa-bb-cc-dd-ee-ff) → normalized to colons.
+        Normalizes MACs to standard 00:00:00:00:00:00 format.
         """
         ip_addr: Optional[str] = None
-        mac_addr: Optional[str] = None
+        mac_addr_raw: Optional[str] = None
 
         if self._os_type == "Windows":
             # Windows format: "  192.168.1.1     aa-bb-cc-dd-ee-ff     dynamic"
@@ -259,9 +277,10 @@ class NetworkScanner:
             )
             if match:
                 ip_addr = match.group(1)
-                mac_addr = match.group(2).replace("-", ":").lower()
+                mac_addr_raw = match.group(2).replace("-", ":")
         else:
             # macOS / Linux: "? (192.168.1.1) at aa:bb:cc:dd:ee:ff ..."
+            # Note: macOS might return "6:c7:1:f5:1:7f" (single hex digits)
             match = re.search(
                 r"\((\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\)\s+at\s+"
                 r"([0-9a-fA-F:]+)",
@@ -269,13 +288,23 @@ class NetworkScanner:
             )
             if match:
                 ip_addr = match.group(1)
-                mac_addr = match.group(2).lower()
+                mac_addr_raw = match.group(2)
+
+        if not ip_addr or not mac_addr_raw:
+            return None
+
+        # Normalize MAC (ensure leading zeros: 6:c7:1 -> 06:c7:01)
+        try:
+            parts = mac_addr_raw.split(":")
+            if len(parts) == 6:
+                formatted_parts = [p.zfill(2) for p in parts]
+                mac_addr = ":".join(formatted_parts).lower()
+            else:
+                return None
+        except Exception:
+            return None
 
         # Validation: reject incomplete, broadcast, and zero MACs
-        if not ip_addr or not mac_addr:
-            return None
-        if "incomplete" in line.lower():
-            return None
         if mac_addr in ("ff:ff:ff:ff:ff:ff", "00:00:00:00:00:00"):
             return None
         # Reject multicast (224.0.0.0 – 239.255.255.255) and broadcast IPs

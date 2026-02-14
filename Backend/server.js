@@ -25,6 +25,8 @@ const cors = require('cors');
 const helmet = require('helmet');
 const morgan = require('morgan');
 const rateLimit = require('express-rate-limit');
+const fs = require('fs'); // Added fs
+const path = require('path');
 const net = require('net');
 const dns = require('dns');
 const { exec } = require('child_process');
@@ -52,14 +54,28 @@ const supabase = (SUPABASE_URL && SUPABASE_KEY)
 
 const app = express();
 
-// Security headers (XSS protection, HSTS, content-type sniffing prevention)
-app.use(helmet());
+// Security headers — configured to allow web frontend assets
+app.use(helmet({
+    contentSecurityPolicy: {
+        directives: {
+            defaultSrc: ["'self'"],
+            scriptSrc: ["'self'"],
+            styleSrc: ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com"],
+            fontSrc: ["'self'", "https://fonts.gstatic.com", "data:"],
+            imgSrc: ["'self'", "data:"],
+            connectSrc: ["'self'"],
+        }
+    }
+}));
 
 // CORS — allow all origins for mobile app access
 app.use(cors());
 
 // Body parsing
 app.use(express.json());
+
+// Serve web frontend
+app.use(express.static(path.join(__dirname, 'public')));
 
 // Request logging with timestamps
 app.use(morgan(':date[iso] :method :url :status :response-time ms'));
@@ -167,14 +183,42 @@ honeypot.listen(HONEYPOT_PORT, '0.0.0.0', () => {
 //  HELPERS
 // ═══════════════════════════════════════════════════════════════════════════════
 
+const LOCAL_OUI_DB = {
+    '00:03:93': 'Apple', '00:05:02': 'Apple', '00:0a:27': 'Apple', '00:0a:95': 'Apple', '00:0d:93': 'Apple',
+    '34:af:2c': 'Apple', '44:4a:db': 'Apple', 'd0:03:4b': 'Apple', 'f0:d1:a9': 'Apple', 'fc:25:3f': 'Apple',
+    '00:00:f0': 'Samsung', '00:07:ab': 'Samsung', '00:0d:ae': 'Samsung', '00:12:47': 'Samsung', 'a4:70:d6': 'Samsung',
+    '8c:c7:01': 'Samsung', '60:af:6d': 'Samsung', '08:ee:8b': 'Samsung', '1c:5a:3e': 'Samsung',
+    '00:1a:11': 'Google', '20:df:b9': 'Google', '3c:5a:b4': 'Google', '94:eb:cd': 'Google', 'da:a1:19': 'Google',
+    '00:24:e4': 'Withings', '00:1d:c9': 'Nest', '18:b4:30': 'Nest',
+    '00:1c:2b': 'Dell', '00:1d:09': 'Dell', '00:21:70': 'Dell',
+    '00:1c:c0': 'HP', '00:1d:0f': 'HP', '00:21:5a': 'HP',
+    '04:33:89': 'Huawei', '08:19:a6': 'Huawei',
+    '00:19:70': 'ZTE', '00:1a:c4': 'ZTE',
+    '00:22:6b': 'Linksys', '00:23:69': 'Linksys',
+    '00:18:4d': 'Netgear', '00:1b:2f': 'Netgear', 'c0:3f:0e': 'Netgear',
+    '00:1d:7e': 'TP-Link', '00:1e:a6': 'TP-Link', 'b0:4e:26': 'TP-Link', 'f8:1a:67': 'TP-Link',
+    '00:26:bb': 'Sony', '00:24:33': 'Sony', '00:1d:ba': 'Sony',
+    '00:1f:3b': 'Intel', '00:21:5d': 'Intel',
+    'b8:27:eb': 'Raspberry Pi', 'dc:a6:32': 'Raspberry Pi', 'e4:5f:01': 'Raspberry Pi',
+    '00:1e:c0': 'Micro-Star (MSI)', '00:24:21': 'Micro-Star (MSI)',
+    '24:da:33': 'Tesla', '44:fb:42': 'Tesla',
+    '40:9f:38': 'Ring', 'c4:7c:8d': 'Ring', 'f0:d8:19': 'Ring',
+    '2c:f7:f1': 'Espressif (IoT)', '30:ae:a4': 'Espressif (IoT)', 'bc:dd:c2': 'Espressif (IoT)'
+};
+
 /**
- * Lookup MAC vendor with fallback.
- * Edge case: mac-lookup might throw on malformed MACs → caught.
+ * Lookup MAC vendor with local cache + library fallback.
  */
 function lookupVendor(mac) {
     return new Promise((resolve) => {
+        if (!mac) return resolve('Unknown');
+
+        const prefix = mac.substring(0, 8).toLowerCase();
+        if (LOCAL_OUI_DB[prefix]) return resolve(LOCAL_OUI_DB[prefix]);
+
         try {
-            resolve(macLookup.lookup(mac) || 'Unknown');
+            const vendor = macLookup.lookup(mac);
+            resolve(vendor || 'Unknown');
         } catch {
             resolve('Unknown');
         }
@@ -185,20 +229,45 @@ function lookupVendor(mac) {
  * Classify device type based on vendor string.
  * Edge case: null/undefined vendor → defaults to 'Unknown Device'.
  */
-function classifyDevice(vendor) {
-    const v = (vendor || '').toLowerCase();
+function classifyDevice(vendor, mac) {
+    const v = (vendor || 'Unknown').toLowerCase();
 
-    if (/apple|iphone|ipad|macbook|airpods/.test(v)) return 'Apple Device';
-    if (/samsung|galaxy|android/.test(v)) return 'Android Device';
-    if (/tp-link|netgear|asus|linksys|d-link|router|gateway/.test(v)) return 'Router/Gateway';
-    if (/amazon|alexa|echo|ring/.test(v)) return 'Smart Home';
-    if (/google|nest|chromecast|pixel/.test(v)) return 'Google Device';
-    if (/intel|dell|lenovo|hp|microsoft/.test(v)) return 'PC/Laptop';
-    if (/espressif|tuya|shelly|iot/.test(v)) return 'IoT Device';
-    if (/camera|hikvision|dahua|axis/.test(v)) return 'IP Camera';
-    if (/printer|brother|canon|epson/.test(v)) return 'Printer';
-    if (/raspberry|pi/.test(v)) return 'Raspberry Pi';
-    if (/sonos|roku|fire|tv|media/.test(v)) return 'Media Device';
+    // Check for Locally Administered Address (Randomized/Private MAC)
+    // The second-least significant bit of the first octet is 1.
+    // e.g. x2, x6, xA, xE in first octet.
+    if (mac) {
+        const firstOctet = parseInt(mac.split(':')[0], 16);
+        if ((firstOctet & 0x02) === 0x02) return 'Privacy-Randomized MAC';
+    }
+
+    // Apple Ecosystem
+    if (/apple|iphone|ipad|macbook|airpods|imac|watch|beats/.test(v)) return 'Apple Device';
+
+    // Mobile & Tablets
+    if (/samsung|galaxy|android|xiaomi|redmi|oppo|vivo|huawei|honor|realme|motorola|nokia|hmd|oneplus/.test(v)) return 'Mobile Device';
+    if (/google|pixel|nest|chromecast/.test(v)) return 'Google Device';
+
+    // Computers & Laptops
+    if (/intel|dell|lenovo|hp|hewlett-packard|asustek|asus|microsoft|acer|msi|gigabyte|fujitsu|toshiba|sony/.test(v)) return 'PC/Laptop';
+
+    // Networking
+    if (/tp-link|netgear|asus|linksys|d-link|router|gateway|ubiquiti|cisco|meraki|mikrotik|zyxel|tenda|huawei|zte|aruba|juniper|synology/.test(v)) return 'Networking Gear';
+
+    // IoT & Smart Home
+    if (/amazon|alexa|echo|ring|blink|eero/.test(v)) return 'Amazon Smart Home';
+    if (/espressif|tuya|shelly|sonoff|itead|aqara|xiaomi|yeelight|philips|hue|ikea|tradfri/.test(v)) return 'IoT Device';
+    if (/tp-link.*smart|kasa|lifx|wemo|tplink|meross/.test(v)) return 'IoT Device';
+
+    // Security / Cameras
+    if (/camera|hikvision|dahua|axis|reolink|wyze|arlo|amcrest|ezviz|hanwha|uniview/.test(v)) return 'IP Camera';
+
+    // Entertainment
+    if (/sonos|roku|fire|tv|media|nvidia|shield|lg|vizio|panasonic|tcl|hisense|denon|marantz|yamaha|bose/.test(v)) return 'Media Device';
+    if (/nintendo|playstation|xbox|sony/.test(v)) return 'Gaming Console';
+
+    // Printers & Peripherals
+    if (/printer|brother|canon|epson|xerox|kyocera|lexmark|ricoh|konica/.test(v)) return 'Printer';
+    if (/raspberry|pi|arduino|stmicroelectronics|texas instruments|atmel/.test(v)) return 'Dev Board';
 
     return 'Unknown Device';
 }
@@ -337,7 +406,7 @@ app.get('/health', (req, res) => {
 app.get('/api/scan', (req, res) => {
     console.log('📡 Scan requested...');
 
-    exec('python3 ../agent.py', { timeout: 30000 }, async (error, stdout, stderr) => {
+    exec('python3 ../agent.py', { timeout: 120000 }, async (error, stdout, stderr) => {
         if (stderr) console.log('Agent:', stderr.trim());
 
         if (error) {
@@ -359,7 +428,7 @@ app.get('/api/scan', (req, res) => {
 
                     const vendor = await lookupVendor(device.mac);
                     const hostname = await resolveHostname(device.ip);
-                    return { ...device, vendor, type: classifyDevice(vendor), hostname };
+                    return { ...device, vendor, type: classifyDevice(vendor, device.mac), hostname };
                 })
             );
 
@@ -551,6 +620,218 @@ app.get('/api/traffic', (req, res) => {
     }
 });
 
+// ── MitM / Traffic Monitor API ──────────────────────────────────────────────
+
+let activeMitmProcess = null;
+
+/**
+ * Get active network interface (auto-detect for macOS & Linux)
+ */
+function getNetworkInterface() {
+    const { networkInterfaces } = require('os');
+    const nets = networkInterfaces();
+    // Prefer common interface names
+    const preferred = ['wlan0', 'en0', 'eth0', 'wlp2s0', 'enp0s3', 'Wi-Fi'];
+    for (const name of preferred) {
+        if (nets[name]) {
+            const hasIPv4 = nets[name].some(n => n.family === 'IPv4' && !n.internal);
+            if (hasIPv4) return name;
+        }
+    }
+    // Fallback: first non-internal IPv4 interface
+    for (const [name, addrs] of Object.entries(nets)) {
+        if (addrs.some(n => n.family === 'IPv4' && !n.internal)) return name;
+    }
+    return process.platform === 'darwin' ? 'en0' : 'wlan0';
+}
+
+/**
+ * Get Default Gateway IP
+ */
+function getGatewayIP() {
+    return new Promise((resolve, reject) => {
+        const cmd = process.platform === 'darwin'
+            ? "netstat -nr | grep default | awk '{print $2}' | head -n 1"
+            : "ip route | grep default | awk '{print $3}'";
+
+        exec(cmd, (err, stdout) => {
+            if (err || !stdout) return resolve(null);
+            resolve(stdout.trim());
+        });
+    });
+}
+
+/**
+ * Start MitM Monitoring for a specific target
+ */
+app.post('/api/mitm/start', async (req, res) => {
+    const { ip, duration } = req.body;
+    if (!ip) return res.status(400).json({ error: 'Target IP required' });
+
+    if (activeMitmProcess) {
+        return res.status(409).json({ error: 'Monitoring already active. Stop it first.' });
+    }
+
+    const gateway = await getGatewayIP();
+    if (!gateway) {
+        return res.status(500).json({ error: 'Could not detect Default Gateway IP' });
+    }
+
+    // Path to python script (assuming it's in parent dir relative to Backend/server.js)
+    const scriptPath = path.join(__dirname, '..', 'traffic_monitor.py');
+
+    // Check if sudo is needed (it is, but we assume server runs with sudo OR user has set up passwordless sudo)
+    // We will just run "sudo python3 ..." and hope for the best or assume user runs node with sudo.
+    // If not running as root, this might fail or ask for password (which fails in background).
+    // The user instruction said "You will need to restart the server with sudo afterwards".
+
+    const iface = getNetworkInterface();
+    console.log(`[MitM] Starting monitor for Target: ${ip}, Gateway: ${gateway}, Interface: ${iface}`);
+
+    const spawn = require('child_process').spawn;
+    const isRoot = process.getuid && process.getuid() === 0;
+
+    // Command: if root, just "python3", else "sudo python3"
+    const cmd = isRoot ? 'python3' : 'sudo';
+    const args = isRoot
+        ? [scriptPath, '-t', ip, '-g', gateway, '-i', iface, '--action', 'monitor']
+        : ['python3', scriptPath, '-t', ip, '-g', gateway, '-i', iface, '--action', 'monitor'];
+
+    activeMitmProcess = spawn(cmd, args, {
+        stdio: 'inherit' // Pipe output to console so we can see logs
+    });
+
+    activeMitmProcess.on('error', (err) => {
+        console.error(`[MitM] Failed to start process: ${err.message}`);
+        activeMitmProcess = null;
+    });
+
+    activeMitmProcess.on('exit', (code) => {
+        console.log(`[MitM] Process exited with code ${code}`);
+        activeMitmProcess = null;
+    });
+
+    res.json({ status: 'started', target: ip, gateway, mode: isRoot ? 'root' : 'sudo' });
+});
+
+/**
+ * Stop MitM Monitoring
+ */
+app.post('/api/mitm/stop', (req, res) => {
+    if (activeMitmProcess) {
+        // Send SIGTERM to python script
+        // Note: sudo might mask the signal, so we might need to run sudo kill.
+        // But spawn('sudo'...) means activeMitmProcess.kill() kills the sudo process.
+        // The python script handles signals, so sudo usually forwards it.
+        // If not, we might need: exec(`sudo pkill -f "python3 .*traffic_monitor.py"`)
+
+        console.log('[MitM] Stopping monitor...');
+        activeMitmProcess.kill('SIGTERM');
+
+        // Fallback: Force kill after 2s if still running
+        setTimeout(() => {
+            if (activeMitmProcess) {
+                exec('sudo pkill -f "traffic_monitor.py"', () => {
+                    activeMitmProcess = null;
+                });
+            }
+        }, 2000);
+
+        activeMitmProcess = null;
+        res.json({ status: 'stopped' });
+    } else {
+        res.json({ status: 'already_stopped' });
+    }
+});
+
+/**
+ * Start Blocking (Deny Internet)
+ */
+app.post('/api/block/start', async (req, res) => {
+    const { ip } = req.body;
+    if (!ip) return res.status(400).json({ error: 'Target IP required' });
+
+    if (activeMitmProcess) {
+        return res.status(409).json({ error: 'An operation is already active. Stop it first.' });
+    }
+
+    const gateway = await getGatewayIP();
+    if (!gateway) {
+        return res.status(500).json({ error: 'Could not detect Default Gateway IP' });
+    }
+
+    const scriptPath = path.join(__dirname, '..', 'traffic_monitor.py');
+    const iface = getNetworkInterface();
+    console.log(`[Block] Starting BLOCK for Target: ${ip}, Gateway: ${gateway}, Interface: ${iface}`);
+
+    const spawn = require('child_process').spawn;
+    const isRoot = process.getuid && process.getuid() === 0;
+    const cmd = isRoot ? 'python3' : 'sudo';
+    const args = isRoot
+        ? [scriptPath, '-t', ip, '-g', gateway, '-i', iface, '--action', 'block']
+        : ['python3', scriptPath, '-t', ip, '-g', gateway, '-i', iface, '--action', 'block'];
+
+    activeMitmProcess = spawn(cmd, args, {
+        stdio: 'inherit'
+    });
+
+    activeMitmProcess.on('error', (err) => {
+        console.error(`[Block] Failed to start process: ${err.message}`);
+        activeMitmProcess = null;
+    });
+
+    activeMitmProcess.on('exit', (code) => {
+        console.log(`[Block] Process exited with code ${code}`);
+        activeMitmProcess = null;
+    });
+
+    res.json({ status: 'blocking_started', target: ip });
+});
+
+/**
+ * Stop Blocking (Same as MitM Stop)
+ */
+app.post('/api/block/stop', (req, res) => {
+    // Reuse the same logic since we track the process in the same variable
+    if (activeMitmProcess) {
+        console.log('[Block] Stopping block...');
+        activeMitmProcess.kill('SIGTERM');
+
+        // Fallback
+        setTimeout(() => {
+            if (activeMitmProcess) {
+                exec('sudo pkill -f "traffic_monitor.py"', () => {
+                    activeMitmProcess = null;
+                });
+            }
+        }, 2000);
+
+        activeMitmProcess = null;
+        res.json({ status: 'stopped' });
+    } else {
+        res.json({ status: 'already_stopped' });
+    }
+});
+
+/**
+ * Get Real-time MitM Stats
+ */
+app.get('/api/mitm/stats', (req, res) => {
+    const statsFile = path.join(__dirname, '..', 'traffic_stats.json');
+
+    fs.readFile(statsFile, 'utf8', (err, data) => {
+        if (err) {
+            return res.json({ status: 'no_data', error: err.message });
+        }
+        try {
+            const json = JSON.parse(data);
+            res.json(json);
+        } catch (e) {
+            res.json({ status: 'error', error: 'Invalid JSON' });
+        }
+    });
+});
+
 // ── Server Status ─────────────────────────────────────────────────────────────
 app.get('/api/status', async (req, res) => {
     const dbDeviceCount = await getDeviceCount();
@@ -572,8 +853,22 @@ app.get('/api/status', async (req, res) => {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 app.listen(PORT, '0.0.0.0', () => {
+    // Get local IP for display
+    const { networkInterfaces } = require('os');
+    const nets = networkInterfaces();
+    let localIP = 'localhost';
+
+    for (const name of Object.keys(nets)) {
+        for (const net of nets[name]) {
+            if (net.family === 'IPv4' && !net.internal) {
+                localIP = net.address;
+                break;
+            }
+        }
+    }
+
     console.log(`\n🚀 Server on http://0.0.0.0:${PORT}`);
-    console.log(`   → Phone:    http://192.168.1.103:${PORT}`);
+    console.log(`   → Phone:    http://${localIP}:${PORT}`);
     console.log(`   → Emulator: http://10.0.2.2:${PORT}`);
     console.log(`   → Local:    http://localhost:${PORT}\n`);
 });

