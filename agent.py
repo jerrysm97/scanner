@@ -278,8 +278,27 @@ class NetworkScanner:
             return None
         if mac_addr in ("ff:ff:ff:ff:ff:ff", "00:00:00:00:00:00"):
             return None
+        # Reject multicast (224.0.0.0 – 239.255.255.255) and broadcast IPs
+        if self._is_multicast_or_broadcast(ip_addr):
+            return None
 
         return (ip_addr, mac_addr)
+
+    @staticmethod
+    def _is_multicast_or_broadcast(ip: str) -> bool:
+        """
+        Returns True if the IP is multicast (224-239.x.x.x) or broadcast (255.255.255.255).
+        These are protocol-level addresses, not real devices.
+        """
+        try:
+            first_octet = int(ip.split('.')[0])
+            if 224 <= first_octet <= 239:
+                return True
+            if ip == '255.255.255.255':
+                return True
+        except (ValueError, IndexError):
+            pass
+        return False
 
     def _build_scan_result(self, device_list: list, scan_mode: str) -> dict:
         """Build standardized JSON response for scan results."""

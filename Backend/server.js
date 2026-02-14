@@ -26,6 +26,7 @@ const helmet = require('helmet');
 const morgan = require('morgan');
 const rateLimit = require('express-rate-limit');
 const net = require('net');
+const dns = require('dns');
 const { exec } = require('child_process');
 const macLookup = require('mac-lookup');
 const { createClient } = require('@supabase/supabase-js');
@@ -203,6 +204,54 @@ function classifyDevice(vendor) {
 }
 
 /**
+ * Check if an IP is multicast (224-239.x.x.x) or broadcast.
+ * These are protocol-level addresses, not real devices.
+ */
+function isMulticast(ip) {
+    if (!ip || typeof ip !== 'string') return true;
+    const parts = ip.split('.');
+    if (parts.length !== 4) return true;
+    const firstOctet = parseInt(parts[0], 10);
+    if (firstOctet >= 224 && firstOctet <= 239) return true;
+    if (ip === '255.255.255.255') return true;
+    return false;
+}
+
+/**
+ * Resolve hostname for a local device using multiple strategies:
+ * 1. dns-sd (macOS mDNS/Bonjour) — resolves names like "Jerry's-iPhone"
+ * 2. dns.reverse() — standard reverse DNS
+ * 3. Fallback to "Unknown"
+ *
+ * dns-sd is run with a 3-second timeout.
+ */
+function resolveHostname(ip) {
+    return new Promise((resolve) => {
+        // Strategy 1: Use arp -a to see if hostname was broadcast
+        exec(`arp -a | grep '(${ip})'`, { timeout: 3000 }, (err1, stdout1) => {
+            if (!err1 && stdout1) {
+                // macOS format: "hostname.local (192.168.1.x) at ..."
+                const match = stdout1.match(/^([\w.-]+)\s+\(/);
+                if (match && match[1] !== '?') {
+                    return resolve(match[1].replace('.local', ''));
+                }
+            }
+
+            // Strategy 2: Standard reverse DNS
+            dns.promises.reverse(ip)
+                .then(names => {
+                    if (names && names.length > 0 && names[0] !== ip) {
+                        resolve(names[0]);
+                    } else {
+                        resolve('Unknown');
+                    }
+                })
+                .catch(() => resolve('Unknown'));
+        });
+    });
+}
+
+/**
  * Supabase upsert — saves devices with MAC as conflict target.
  * Updates 'last_seen' column every time a device is re-discovered.
  *
@@ -234,8 +283,8 @@ async function saveToSupabase(deviceList) {
             ip: d.ip,
             vendor: d.vendor || 'Unknown',
             type: d.type || 'Unknown Device',
+            hostname: d.hostname || 'Unknown',
             status: 'online',
-            risk: d.risk || 'LOW',
             last_seen: new Date().toISOString(),
         }));
 
@@ -305,22 +354,29 @@ app.get('/api/scan', (req, res) => {
 
             const enrichedDevices = await Promise.all(
                 (scanData.devices || []).map(async (device) => {
+                    // Skip multicast/broadcast IPs
+                    if (isMulticast(device.ip)) return null;
+
                     const vendor = await lookupVendor(device.mac);
-                    return { ...device, vendor, type: classifyDevice(vendor), risk: 'LOW' };
+                    const hostname = await resolveHostname(device.ip);
+                    return { ...device, vendor, type: classifyDevice(vendor), hostname };
                 })
             );
 
+            // Remove null entries (filtered multicast)
+            const filteredDevices = enrichedDevices.filter(d => d !== null);
+
             // Supabase upsert
-            const dbResult = await saveToSupabase(enrichedDevices);
-            totalDevicesLogged = Math.max(totalDevicesLogged, enrichedDevices.length);
+            const dbResult = await saveToSupabase(filteredDevices);
+            totalDevicesLogged = Math.max(totalDevicesLogged, filteredDevices.length);
             const dbDeviceCount = await getDeviceCount();
 
             res.json({
                 status: 'success',
                 scan_mode: scanData.scan_mode || 'passive',
                 subnet: scanData.subnet || 'unknown',
-                count: enrichedDevices.length,
-                devices: enrichedDevices,
+                count: filteredDevices.length,
+                devices: filteredDevices,
                 database: {
                     saved: dbResult.saved,
                     total_logged: dbDeviceCount,
@@ -387,6 +443,112 @@ app.get('/api/audit', (req, res) => {
 // ── Honeypot Logs ─────────────────────────────────────────────────────────────
 app.get('/api/honeypot', (req, res) => {
     res.json(honeypotLogs);
+});
+
+// ── Device History (from Supabase) ────────────────────────────────────────
+app.get('/api/device-history', async (req, res) => {
+    const mac = req.query.mac;
+    if (!mac || typeof mac !== 'string') {
+        return res.status(400).json({ error: 'Missing mac parameter' });
+    }
+
+    if (!supabase) {
+        return res.json({ mac, history: [], message: 'Supabase not configured' });
+    }
+
+    try {
+        const { data, error } = await supabase
+            .from('devices')
+            .select('*')
+            .eq('mac', mac)
+            .order('last_seen', { ascending: false })
+            .limit(20);
+
+        if (error) {
+            return res.status(500).json({ error: error.message });
+        }
+
+        res.json({ mac, history: data || [] });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// ── Traffic Statistics ────────────────────────────────────────────────────────
+app.get('/api/traffic', (req, res) => {
+    // Use nettop on macOS or /proc/net/dev on Linux for traffic stats
+    const platform = process.platform;
+
+    if (platform === 'darwin') {
+        // macOS: use netstat -ib for interface stats
+        exec('netstat -ib', { timeout: 5000 }, (error, stdout) => {
+            if (error) {
+                return res.json({ error: 'Failed to get traffic stats', upload_bytes: 0, download_bytes: 0, connections: 0 });
+            }
+
+            let totalIn = 0;
+            let totalOut = 0;
+            const lines = stdout.split('\n');
+            for (const line of lines) {
+                // Skip header and loopback
+                if (line.includes('Name') || line.includes('lo0') || !line.trim()) continue;
+                const parts = line.trim().split(/\s+/);
+                // Format: Name Mtu Network Address Ipkts Ierrs Ibytes Opkts Oerrs Obytes Coll
+                if (parts.length >= 10) {
+                    const ibytes = parseInt(parts[6], 10);
+                    const obytes = parseInt(parts[9], 10);
+                    if (!isNaN(ibytes)) totalIn += ibytes;
+                    if (!isNaN(obytes)) totalOut += obytes;
+                }
+            }
+
+            // Get active connection count
+            exec('netstat -an | grep ESTABLISHED | wc -l', { timeout: 3000 }, (err2, stdout2) => {
+                const connections = parseInt((stdout2 || '0').trim(), 10) || 0;
+                res.json({
+                    upload_bytes: totalOut,
+                    download_bytes: totalIn,
+                    connections,
+                    upload_mb: (totalOut / (1024 * 1024)).toFixed(1),
+                    download_mb: (totalIn / (1024 * 1024)).toFixed(1),
+                    timestamp: new Date().toISOString(),
+                });
+            });
+        });
+    } else {
+        // Linux: read /proc/net/dev
+        exec('cat /proc/net/dev', { timeout: 3000 }, (error, stdout) => {
+            if (error) {
+                return res.json({ error: 'Failed to get traffic stats', upload_bytes: 0, download_bytes: 0, connections: 0 });
+            }
+
+            let totalIn = 0;
+            let totalOut = 0;
+            const lines = stdout.split('\n');
+            for (const line of lines) {
+                if (line.includes('|') || line.includes('lo:') || !line.includes(':')) continue;
+                const parts = line.trim().split(/\s+/);
+                if (parts.length >= 10) {
+                    const rxBytes = parseInt(parts[1], 10);
+                    const txBytes = parseInt(parts[9], 10);
+                    if (!isNaN(rxBytes)) totalIn += rxBytes;
+                    if (!isNaN(txBytes)) totalOut += txBytes;
+                }
+            }
+
+            exec('netstat -an | grep ESTABLISHED | wc -l', { timeout: 3000 }, (err2, stdout2) => {
+                const connections = parseInt((stdout2 || '0').trim(), 10) || 0;
+                res.json({
+                    upload_bytes: totalOut,
+                    download_bytes: totalIn,
+                    connections,
+                    upload_mb: (totalOut / (1024 * 1024)).toFixed(1),
+                    download_mb: (totalIn / (1024 * 1024)).toFixed(1),
+                    timestamp: new Date().toISOString(),
+                });
+            });
+        });
+    }
 });
 
 // ── Server Status ─────────────────────────────────────────────────────────────

@@ -1,25 +1,21 @@
 /**
  * ═══════════════════════════════════════════════════════════════════════════════
- *  Sentinel Mobile v5.0 — Production-Ready Enterprise App
+ *  Sentinel Mobile v6.0 — Professional Enterprise Network Security
  * ═══════════════════════════════════════════════════════════════════════════════
  *
- *  Enterprise Features:
- *  ► Settings Screen        — Change server IP dynamically (persisted)
- *  ► Skeleton Loader        — Animated placeholder during scans
- *  ► Toast Notifications    — Non-intrusive status messages (no Alert spam)
- *  ► Offline Handling       — Clean "Cannot Connect" screen with Retry
- *  ► Database Status        — Shows total devices logged in Supabase
- *  ► Long-Press Audit       — Credential audit via long press
- *  ► Honeypot Alerts        — Polls every 10s for intrusion events
- *  ► Report Sharing         — Export security report via Share API
- *  ► AsyncStorage           — Persists trusted devices & settings
- *
- *  Edge Cases Handled:
- *  - Server unreachable     → Offline screen with retry button
- *  - Empty scan results     → "No devices found" message
- *  - AsyncStorage failure   → Falls back to in-memory state
- *  - Invalid server URL     → Validation before saving
- *  - FlatList key collisions→ MAC used as unique key
+ *  Features:
+ *  ► Device Names          — Shows hostnames instead of raw IPs
+ *  ► Device Detail Modal   — Full detail view on tap (ports, history, risk)
+ *  ► Connection History    — Shows when device was first/last seen
+ *  ► Professional UI       — Industry-grade dark mode with glassmorphism
+ *  ► Settings Screen       — Change server IP dynamically (persisted)
+ *  ► Skeleton Loader       — Animated placeholder during scans
+ *  ► Toast Notifications   — Non-intrusive status messages
+ *  ► Offline Handling      — Clean "Cannot Connect" screen with Retry
+ *  ► Database Status       — Shows total devices logged in Supabase
+ *  ► Long-Press Audit      — Credential audit via long press
+ *  ► Honeypot Alerts       — Polls every 10s for intrusion events
+ *  ► Report Sharing        — Export security report via Share API
  */
 
 import React, { useState, useEffect, useCallback, useRef } from 'react';
@@ -39,6 +35,7 @@ import {
   Modal,
   TextInput,
   Dimensions,
+  ScrollView,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
@@ -51,8 +48,27 @@ interface Device {
   mac: string;
   vendor?: string;
   type?: string;
+  hostname?: string;
   status?: string;
   risk?: string;
+  last_seen?: string;
+}
+
+interface DeepScanResult {
+  hostname?: string;
+  open_ports?: Array<{ port: number; banner?: string }>;
+  port_count?: number;
+  risk_level?: string;
+  error?: string;
+}
+
+interface HistoryEntry {
+  ip: string;
+  mac: string;
+  vendor?: string;
+  type?: string;
+  hostname?: string;
+  status?: string;
   last_seen?: string;
 }
 
@@ -77,13 +93,9 @@ const DEFAULT_SERVER = 'http://192.168.1.103:3000';
 const SCREEN_WIDTH = Dimensions.get('window').width;
 
 // ═══════════════════════════════════════════════════════════════════════════════
-//  TOAST COMPONENT — Non-intrusive notification bar
+//  TOAST COMPONENT
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/**
- * Replaces Alert.alert with a slide-down toast that auto-dismisses.
- * Edge case: multiple toasts → latest one replaces the previous.
- */
 function Toast({ message, type, visible }: { message: string; type: 'success' | 'error' | 'info'; visible: boolean }) {
   const translateY = useRef(new Animated.Value(-80)).current;
 
@@ -107,13 +119,9 @@ function Toast({ message, type, visible }: { message: string; type: 'success' | 
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-//  SKELETON LOADER — Animated placeholder during scans
+//  SKELETON LOADER
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/**
- * Renders 4 pulsing placeholder cards while scanning is in progress.
- * Provides visual feedback that the app is working (better than a spinner).
- */
 function SkeletonLoader() {
   const pulseAnim = useRef(new Animated.Value(0.3)).current;
 
@@ -129,7 +137,7 @@ function SkeletonLoader() {
   return (
     <View style={styles.skeletonContainer}>
       <Text style={styles.scanningTitle}>📡 Scanning Network...</Text>
-      <Text style={styles.scanningHint}>Looking for devices on your WiFi</Text>
+      <Text style={styles.scanningHint}>Discovering devices on your WiFi</Text>
       {[1, 2, 3, 4].map(i => (
         <Animated.View key={i} style={[styles.skeletonCard, { opacity: pulseAnim }]}>
           <View style={styles.skeletonRow}>
@@ -146,13 +154,9 @@ function SkeletonLoader() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-//  OFFLINE SCREEN — Clean "Cannot Connect" with Retry
+//  OFFLINE SCREEN
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/**
- * Shown when the server is unreachable. Provides clear instructions and a Retry button.
- * Edge case: user taps retry rapidly → debounced by the loading state in parent.
- */
 function OfflineScreen({ serverUrl, onRetry, onOpenSettings }: {
   serverUrl: string;
   onRetry: () => void;
@@ -183,6 +187,189 @@ function OfflineScreen({ serverUrl, onRetry, onOpenSettings }: {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+//  DEVICE DETAIL MODAL
+// ═══════════════════════════════════════════════════════════════════════════════
+
+function DeviceDetailModal({
+  visible,
+  device,
+  scanResult,
+  history,
+  isTrusted,
+  loading,
+  onClose,
+  onToggleTrust,
+  onAudit,
+}: {
+  visible: boolean;
+  device: Device | null;
+  scanResult: DeepScanResult | null;
+  history: HistoryEntry[];
+  isTrusted: boolean;
+  loading: boolean;
+  onClose: () => void;
+  onToggleTrust: () => void;
+  onAudit: () => void;
+}) {
+  if (!device) return null;
+
+  const displayName = device.hostname && device.hostname !== 'Unknown'
+    ? device.hostname
+    : device.type || 'Unknown Device';
+
+  const riskLevel = scanResult?.risk_level || 'LOW';
+  const riskColor = riskLevel === 'HIGH' ? '#ff4444' : riskLevel === 'MEDIUM' ? '#ffaa00' : '#00ff88';
+
+  return (
+    <Modal visible={visible} transparent animationType="slide">
+      <View style={styles.detailOverlay}>
+        <View style={styles.detailContainer}>
+          {/* Header */}
+          <View style={styles.detailHeader}>
+            <View style={styles.detailHeaderLeft}>
+              <Text style={styles.detailEmoji}>{typeEmojiStatic(device.type || '')}</Text>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.detailName} numberOfLines={1}>{displayName}</Text>
+                <Text style={styles.detailType}>{device.vendor || 'Unknown Vendor'}</Text>
+              </View>
+            </View>
+            <TouchableOpacity style={styles.detailCloseBtn} onPress={onClose}>
+              <Text style={styles.detailCloseBtnText}>✕</Text>
+            </TouchableOpacity>
+          </View>
+
+          <ScrollView style={styles.detailScroll} showsVerticalScrollIndicator={false}>
+            {/* Status Badge */}
+            <View style={styles.detailStatusRow}>
+              <View style={[styles.detailBadge, { backgroundColor: isTrusted ? '#0a2a14' : '#2a0a0a' }]}>
+                <Text style={{ color: isTrusted ? '#00ff88' : '#ff4444', fontSize: 12, fontWeight: '700' }}>
+                  {isTrusted ? '✅ TRUSTED' : '⚠️ UNTRUSTED'}
+                </Text>
+              </View>
+              <View style={[styles.detailBadge, { backgroundColor: riskLevel === 'LOW' ? '#0a2a14' : '#2a0a0a' }]}>
+                <Text style={{ color: riskColor, fontSize: 12, fontWeight: '700' }}>
+                  Risk: {riskLevel}
+                </Text>
+              </View>
+            </View>
+
+            {/* Network Info */}
+            <View style={styles.detailSection}>
+              <Text style={styles.detailSectionTitle}>NETWORK INFO</Text>
+              <View style={styles.detailInfoGrid}>
+                <InfoRow label="IP Address" value={device.ip} />
+                <InfoRow label="MAC Address" value={device.mac} />
+                <InfoRow label="Hostname" value={device.hostname || 'Unknown'} />
+                <InfoRow label="Vendor" value={device.vendor || 'Unknown'} />
+                <InfoRow label="Device Type" value={device.type || 'Unknown'} />
+              </View>
+            </View>
+
+            {/* Port Scan Results */}
+            <View style={styles.detailSection}>
+              <Text style={styles.detailSectionTitle}>PORT SCAN</Text>
+              {loading ? (
+                <View style={styles.detailLoadingRow}>
+                  <ActivityIndicator color="#00ff88" size="small" />
+                  <Text style={styles.detailLoadingText}>Scanning ports...</Text>
+                </View>
+              ) : scanResult ? (
+                <View>
+                  <Text style={styles.detailPortCount}>
+                    {scanResult.port_count || 0} open port{(scanResult.port_count || 0) !== 1 ? 's' : ''} found
+                  </Text>
+                  {scanResult.open_ports && scanResult.open_ports.length > 0 ? (
+                    scanResult.open_ports.map((p, idx) => (
+                      <View key={idx} style={styles.portRow}>
+                        <View style={styles.portDot} />
+                        <Text style={styles.portNumber}>:{p.port}</Text>
+                        {p.banner ? <Text style={styles.portBanner}>{p.banner}</Text> : null}
+                      </View>
+                    ))
+                  ) : (
+                    <Text style={styles.detailMuted}>No open ports detected — good!</Text>
+                  )}
+                </View>
+              ) : (
+                <Text style={styles.detailMuted}>Awaiting scan results...</Text>
+              )}
+            </View>
+
+            {/* Connection History */}
+            <View style={styles.detailSection}>
+              <Text style={styles.detailSectionTitle}>CONNECTION HISTORY</Text>
+              {history.length > 0 ? (
+                history.map((h, idx) => (
+                  <View key={idx} style={styles.historyRow}>
+                    <View style={styles.historyDot} />
+                    <View style={{ flex: 1 }}>
+                      <Text style={styles.historyIP}>{h.ip}</Text>
+                      <Text style={styles.historyTime}>
+                        {h.last_seen ? new Date(h.last_seen).toLocaleString() : 'Unknown'}
+                      </Text>
+                    </View>
+                    <Text style={[styles.historyStatus, { color: h.status === 'online' ? '#00ff88' : '#666' }]}>
+                      {h.status || 'seen'}
+                    </Text>
+                  </View>
+                ))
+              ) : (
+                <Text style={styles.detailMuted}>No history available</Text>
+              )}
+            </View>
+          </ScrollView>
+
+          {/* Action Buttons */}
+          <View style={styles.detailActions}>
+            <TouchableOpacity
+              style={[styles.detailActionBtn, isTrusted ? styles.detailActionDanger : styles.detailActionPrimary]}
+              onPress={onToggleTrust}
+            >
+              <Text style={styles.detailActionBtnText}>
+                {isTrusted ? '❌ Remove Trust' : '✅ Mark Trusted'}
+              </Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[styles.detailActionBtn, styles.detailActionSecondary]}
+              onPress={onAudit}
+            >
+              <Text style={styles.detailActionBtnText}>🔐 Audit Credentials</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </View>
+    </Modal>
+  );
+}
+
+function InfoRow({ label, value }: { label: string; value: string }) {
+  return (
+    <View style={styles.infoRow}>
+      <Text style={styles.infoLabel}>{label}</Text>
+      <Text style={styles.infoValue} numberOfLines={1}>{value}</Text>
+    </View>
+  );
+}
+
+// ── Helpers (outside component for use in DeviceDetailModal) ──────────────
+function typeEmojiStatic(type: string): string {
+  if (!type) return '📱';
+  const t = type.toLowerCase();
+  if (t.includes('router')) return '🌐';
+  if (t.includes('apple')) return '🍎';
+  if (t.includes('android')) return '📱';
+  if (t.includes('camera')) return '📷';
+  if (t.includes('printer')) return '🖨️';
+  if (t.includes('google')) return '🔵';
+  if (t.includes('pc') || t.includes('laptop')) return '💻';
+  if (t.includes('iot')) return '⚡';
+  if (t.includes('media')) return '📺';
+  if (t.includes('smart home')) return '🏠';
+  if (t.includes('raspberry')) return '🍓';
+  return '📱';
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 //  APP COMPONENT
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -202,10 +389,22 @@ export default function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsInput, setSettingsInput] = useState('');
 
+  // Device Detail Modal state
+  const [selectedDevice, setSelectedDevice] = useState<Device | null>(null);
+  const [detailVisible, setDetailVisible] = useState(false);
+  const [detailScanResult, setDetailScanResult] = useState<DeepScanResult | null>(null);
+  const [detailHistory, setDetailHistory] = useState<HistoryEntry[]>([]);
+  const [detailLoading, setDetailLoading] = useState(false);
+
   // Toast state
   const [toastMsg, setToastMsg] = useState('');
   const [toastType, setToastType] = useState<'success' | 'error' | 'info'>('info');
   const [toastKey, setToastKey] = useState(0);
+
+  // Traffic state
+  const [trafficUp, setTrafficUp] = useState('0');
+  const [trafficDown, setTrafficDown] = useState('0');
+  const [connections, setConnections] = useState(0);
 
   const bannerAnim = useRef(new Animated.Value(0)).current;
 
@@ -275,6 +474,23 @@ export default function App() {
     return () => clearInterval(interval);
   }, [serverUrl]);
 
+  // ── Traffic Stats Polling ───────────────────────────────────────────────────
+  useEffect(() => {
+    const fetchTraffic = async () => {
+      try {
+        const resp = await fetch(`${serverUrl}/api/traffic`);
+        const data = await resp.json();
+        setTrafficUp(data.upload_mb || '0');
+        setTrafficDown(data.download_mb || '0');
+        setConnections(data.connections || 0);
+      } catch { /* ignore */ }
+    };
+
+    fetchTraffic();
+    const interval = setInterval(fetchTraffic, 15000);
+    return () => clearInterval(interval);
+  }, [serverUrl]);
+
   // ── Network Scan ────────────────────────────────────────────────────────────
   const fetchScan = useCallback(async () => {
     setLoading(true);
@@ -313,33 +529,37 @@ export default function App() {
     }
   }, [serverUrl, showToast]);
 
-  // ── Deep Scan (tap) ─────────────────────────────────────────────────────────
-  const deepScan = useCallback(async (ip: string) => {
-    showToast(`🔍 Scanning ${ip}...`, 'info');
+  // ── Open Device Detail ──────────────────────────────────────────────────────
+  const openDeviceDetail = useCallback(async (device: Device) => {
+    setSelectedDevice(device);
+    setDetailVisible(true);
+    setDetailScanResult(null);
+    setDetailHistory([]);
+    setDetailLoading(true);
 
+    // Fetch deep scan + history in parallel
     try {
-      const response = await fetch(`${serverUrl}/api/inspect?ip=${ip}`);
-      const data = await response.json();
+      const [scanResp, histResp] = await Promise.all([
+        fetch(`${serverUrl}/api/inspect?ip=${device.ip}`).catch(() => null),
+        fetch(`${serverUrl}/api/device-history?mac=${encodeURIComponent(device.mac)}`).catch(() => null),
+      ]);
 
-      if (data.error) {
-        showToast(`Error: ${data.error}`, 'error');
-        return;
+      if (scanResp) {
+        const scanData = await scanResp.json();
+        setDetailScanResult(scanData);
       }
-
-      const portList = data.open_ports?.length > 0
-        ? data.open_ports.map((p: any) => `  • Port ${p.port}${p.banner ? ` (${p.banner})` : ''}`).join('\n')
-        : '  None found';
-
-      Alert.alert(
-        `🔍 ${ip}`,
-        `Host: ${data.hostname}\nPorts (${data.port_count}):\n${portList}\n\nRisk: ${data.risk_level}`
-      );
+      if (histResp) {
+        const histData = await histResp.json();
+        setDetailHistory(histData.history || []);
+      }
     } catch {
-      showToast('Deep scan failed — server unreachable', 'error');
+      // Silently fail — modal will show "awaiting" text
+    } finally {
+      setDetailLoading(false);
     }
-  }, [serverUrl, showToast]);
+  }, [serverUrl]);
 
-  // ── Credential Audit (long press) ──────────────────────────────────────────
+  // ── Credential Audit ──────────────────────────────────────────────────────
   const auditCredentials = useCallback(async (ip: string) => {
     showToast(`🔐 Auditing ${ip}...`, 'info');
 
@@ -386,7 +606,6 @@ export default function App() {
   const saveServerUrl = useCallback(async () => {
     const url = settingsInput.trim();
 
-    // Basic URL validation
     if (!url.startsWith('http://') && !url.startsWith('https://')) {
       showToast('URL must start with http:// or https://', 'error');
       return;
@@ -419,9 +638,11 @@ export default function App() {
       `✅ Trusted: ${trusted.length}  |  ⚠️ Untrusted: ${intruders.length}`,
       `🪤 Honeypot: ${honeypotLogs.length} trigger(s)`,
       ``,
-      ...trusted.map(d => `✅ ${d.ip} | ${d.mac} | ${d.vendor || '?'}`),
+      `── Trusted Devices ──`,
+      ...trusted.map(d => `  ✅ ${d.hostname || d.ip} | ${d.mac} | ${d.vendor || '?'}`),
       ``,
-      ...intruders.map(d => `⚠️ ${d.ip} | ${d.mac} | ${d.vendor || '?'}`),
+      `── Untrusted Devices ──`,
+      ...intruders.map(d => `  ⚠️ ${d.hostname || d.ip} | ${d.mac} | ${d.vendor || '?'}`),
     ];
 
     try {
@@ -429,39 +650,34 @@ export default function App() {
     } catch { /* cancelled */ }
   }, [devices, trustedMacs, honeypotLogs, subnet, scanMode, dbTotal]);
 
-  // ── Helpers ─────────────────────────────────────────────────────────────────
-  const typeEmoji = (type: string) => {
-    if (!type) return '📱';
-    const t = type.toLowerCase();
-    if (t.includes('router')) return '🌐';
-    if (t.includes('apple')) return '🍎';
-    if (t.includes('android')) return '📱';
-    if (t.includes('camera')) return '📷';
-    if (t.includes('printer')) return '🖨️';
-    if (t.includes('google')) return '🔵';
-    if (t.includes('pc')) return '💻';
-    if (t.includes('iot')) return '⚡';
-    if (t.includes('media')) return '📺';
-    return '📱';
+  // ── Get display name for a device ──────────────────────────────────────────
+  const getDeviceName = (device: Device): string => {
+    if (device.hostname && device.hostname !== 'Unknown') return device.hostname;
+    if (device.type && device.type !== 'Unknown Device') return device.type;
+    return device.ip;
   };
 
   // ── Render Device Card ──────────────────────────────────────────────────────
   const renderDevice = ({ item }: { item: Device }) => {
     const isTrusted = trustedMacs.includes(item.mac);
+    const deviceName = getDeviceName(item);
 
     return (
       <TouchableOpacity
         style={[styles.card, isTrusted ? styles.trustedCard : styles.intruderCard]}
-        onPress={() => deepScan(item.ip)}
+        onPress={() => openDeviceDetail(item)}
         onLongPress={() => auditCredentials(item.ip)}
         delayLongPress={600}
         activeOpacity={0.7}
       >
+        {/* Card Top Row */}
         <View style={styles.cardHeader}>
-          <Text style={styles.cardEmoji}>{typeEmoji(item.type || '')}</Text>
+          <View style={styles.cardEmojiWrap}>
+            <Text style={styles.cardEmoji}>{typeEmojiStatic(item.type || '')}</Text>
+          </View>
           <View style={styles.cardInfo}>
-            <Text style={styles.cardIP}>{item.ip}</Text>
-            <Text style={styles.cardType}>{item.type || 'Unknown Device'}</Text>
+            <Text style={styles.cardName} numberOfLines={1}>{deviceName}</Text>
+            <Text style={styles.cardType}>{item.vendor || 'Unknown Vendor'}</Text>
           </View>
           <TouchableOpacity
             style={[styles.trustBtn, isTrusted ? styles.trustedBtnBg : styles.untrustedBtnBg]}
@@ -471,16 +687,26 @@ export default function App() {
           </TouchableOpacity>
         </View>
 
+        {/* Card Details */}
         <View style={styles.cardDetails}>
-          <Text style={styles.cardMAC}>{item.mac}</Text>
-          <Text style={styles.cardVendor}>{item.vendor || 'Unknown vendor'}</Text>
+          <View style={styles.cardDetailRow}>
+            <Text style={styles.cardDetailLabel}>IP</Text>
+            <Text style={styles.cardDetailValue}>{item.ip}</Text>
+          </View>
+          <View style={styles.cardDetailRow}>
+            <Text style={styles.cardDetailLabel}>MAC</Text>
+            <Text style={styles.cardDetailValue}>{item.mac}</Text>
+          </View>
         </View>
 
+        {/* Card Footer */}
         <View style={styles.cardFooter}>
-          <Text style={[styles.badge, isTrusted ? styles.trustedBadge : styles.intruderBadge]}>
-            {isTrusted ? '✅ TRUSTED' : '⚠️ INTRUDER'}
-          </Text>
-          <Text style={styles.hintText}>Tap → Scan  |  Hold → Audit</Text>
+          <View style={[styles.badge, isTrusted ? styles.trustedBadge : styles.intruderBadge]}>
+            <Text style={[styles.badgeText, { color: isTrusted ? '#00ff88' : '#ff4444' }]}>
+              {isTrusted ? '✅ TRUSTED' : '⚠️ INTRUDER'}
+            </Text>
+          </View>
+          <Text style={styles.hintText}>Tap → Details  |  Hold → Audit</Text>
         </View>
       </TouchableOpacity>
     );
@@ -508,15 +734,13 @@ export default function App() {
         <View style={styles.titleRow}>
           <View>
             <Text style={styles.title}>🛡️ SENTINEL</Text>
-            <Text style={styles.subtitle}>Enterprise Network Security v5.0</Text>
+            <Text style={styles.subtitle}>Enterprise Network Security v6.0</Text>
           </View>
           <View style={styles.headerBtns}>
-            {/* Database Status */}
             <View style={styles.dbStatus}>
               <View style={[styles.dbDot, dbConnected ? styles.dbDotOn : styles.dbDotOff]} />
               <Text style={styles.dbText}>DB: {dbTotal}</Text>
             </View>
-            {/* Settings Button */}
             <TouchableOpacity
               style={styles.settingsBtn}
               onPress={() => { setSettingsInput(serverUrl); setSettingsOpen(true); }}
@@ -527,14 +751,53 @@ export default function App() {
         </View>
 
         <View style={styles.statsRow}>
-          <Text style={styles.stat}>📡 {subnet}</Text>
-          <Text style={styles.stat}>🔍 {scanMode}</Text>
-          <Text style={styles.stat}>🕐 {lastScanTime || '—'}</Text>
+          <View style={styles.statCard}>
+            <Text style={styles.statValue}>{devices.length}</Text>
+            <Text style={styles.statLabel}>Devices</Text>
+          </View>
+          <View style={styles.statCard}>
+            <Text style={[styles.statValue, { color: '#00ff88' }]}>
+              {devices.filter(d => trustedMacs.includes(d.mac)).length}
+            </Text>
+            <Text style={styles.statLabel}>Trusted</Text>
+          </View>
+          <View style={styles.statCard}>
+            <Text style={[styles.statValue, { color: '#ff4444' }]}>
+              {devices.filter(d => !trustedMacs.includes(d.mac)).length}
+            </Text>
+            <Text style={styles.statLabel}>Untrusted</Text>
+          </View>
+          <View style={styles.statCard}>
+            <Text style={[styles.statValue, { color: '#ffaa00' }]}>{honeypotLogs.length}</Text>
+            <Text style={styles.statLabel}>Alerts</Text>
+          </View>
         </View>
-        <View style={styles.statsRow}>
-          <Text style={styles.stat}>📊 {devices.length} devices</Text>
-          <Text style={styles.stat}>✅ {devices.filter(d => trustedMacs.includes(d.mac)).length}</Text>
-          <Text style={styles.stat}>⚠️ {devices.filter(d => !trustedMacs.includes(d.mac)).length}</Text>
+
+        <View style={styles.metaRow}>
+          <Text style={styles.metaText}>📡 {subnet}</Text>
+          <Text style={styles.metaText}>🔍 {scanMode}</Text>
+          <Text style={styles.metaText}>🕐 {lastScanTime || '—'}</Text>
+        </View>
+
+        {/* Traffic Stats */}
+        <View style={styles.trafficRow}>
+          <View style={styles.trafficItem}>
+            <Text style={styles.trafficIcon}>⬇️</Text>
+            <Text style={styles.trafficValue}>{trafficDown} MB</Text>
+            <Text style={styles.trafficLabel}>DOWN</Text>
+          </View>
+          <View style={styles.trafficDivider} />
+          <View style={styles.trafficItem}>
+            <Text style={styles.trafficIcon}>⬆️</Text>
+            <Text style={styles.trafficValue}>{trafficUp} MB</Text>
+            <Text style={styles.trafficLabel}>UP</Text>
+          </View>
+          <View style={styles.trafficDivider} />
+          <View style={styles.trafficItem}>
+            <Text style={styles.trafficIcon}>🔗</Text>
+            <Text style={styles.trafficValue}>{connections}</Text>
+            <Text style={styles.trafficLabel}>ACTIVE</Text>
+          </View>
         </View>
       </View>
 
@@ -558,7 +821,7 @@ export default function App() {
             <View style={styles.emptyState}>
               <Text style={styles.emptyEmoji}>📡</Text>
               <Text style={styles.emptyTitle}>No Devices Scanned</Text>
-              <Text style={styles.emptyHint}>Tap "SCAN NETWORK" to discover devices</Text>
+              <Text style={styles.emptyHint}>Tap "SCAN" to discover devices on your network</Text>
             </View>
           }
         />
@@ -574,7 +837,7 @@ export default function App() {
           {loading ? (
             <ActivityIndicator color="#000" size="small" />
           ) : (
-            <Text style={styles.scanBtnText}>📡 SCAN NETWORK</Text>
+            <Text style={styles.scanBtnText}>📡 SCAN</Text>
           )}
         </TouchableOpacity>
 
@@ -586,6 +849,26 @@ export default function App() {
           <Text style={styles.reportBtnText}>📋</Text>
         </TouchableOpacity>
       </View>
+
+      {/* ══ Device Detail Modal ══ */}
+      <DeviceDetailModal
+        visible={detailVisible}
+        device={selectedDevice}
+        scanResult={detailScanResult}
+        history={detailHistory}
+        isTrusted={selectedDevice ? trustedMacs.includes(selectedDevice.mac) : false}
+        loading={detailLoading}
+        onClose={() => setDetailVisible(false)}
+        onToggleTrust={() => {
+          if (selectedDevice) toggleTrust(selectedDevice.mac);
+        }}
+        onAudit={() => {
+          if (selectedDevice) {
+            setDetailVisible(false);
+            auditCredentials(selectedDevice.ip);
+          }
+        }}
+      />
 
       {/* ══ Settings Modal ══ */}
       <Modal visible={settingsOpen} transparent animationType="fade">
@@ -643,55 +926,66 @@ const styles = StyleSheet.create({
   intrusionText: { color: '#fff', fontSize: 12, fontWeight: '800', letterSpacing: 0.5 },
 
   // Header
-  header: { paddingHorizontal: 20, paddingTop: 14, paddingBottom: 10, borderBottomWidth: 1, borderBottomColor: '#151515' },
+  header: { paddingHorizontal: 16, paddingTop: 12, paddingBottom: 12, borderBottomWidth: 1, borderBottomColor: '#111' },
   titleRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-start' },
-  title: { fontSize: 24, fontWeight: '900', color: '#00ff88', letterSpacing: 2 },
-  subtitle: { fontSize: 10, color: '#444', marginTop: 2, letterSpacing: 0.5 },
+  title: { fontSize: 22, fontWeight: '900', color: '#00ff88', letterSpacing: 2 },
+  subtitle: { fontSize: 9, color: '#444', marginTop: 1, letterSpacing: 0.5 },
   headerBtns: { flexDirection: 'row', alignItems: 'center', gap: 8 },
-  dbStatus: { flexDirection: 'row', alignItems: 'center', backgroundColor: '#111', paddingHorizontal: 8, paddingVertical: 5, borderRadius: 6, borderWidth: 1, borderColor: '#222' },
-  dbDot: { width: 7, height: 7, borderRadius: 4, marginRight: 5 },
+  dbStatus: { flexDirection: 'row', alignItems: 'center', backgroundColor: '#0a0a0a', paddingHorizontal: 10, paddingVertical: 6, borderRadius: 8, borderWidth: 1, borderColor: '#1a1a1a' },
+  dbDot: { width: 6, height: 6, borderRadius: 3, marginRight: 5 },
   dbDotOn: { backgroundColor: '#00ff88' },
   dbDotOff: { backgroundColor: '#ff4444' },
-  dbText: { color: '#777', fontSize: 11, fontWeight: '600', fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace' },
-  settingsBtn: { backgroundColor: '#111', padding: 6, borderRadius: 6, borderWidth: 1, borderColor: '#222' },
+  dbText: { color: '#666', fontSize: 11, fontWeight: '600', fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace' },
+  settingsBtn: { backgroundColor: '#0a0a0a', padding: 6, borderRadius: 8, borderWidth: 1, borderColor: '#1a1a1a' },
   settingsBtnText: { fontSize: 18 },
-  statsRow: { flexDirection: 'row', justifyContent: 'space-between', marginTop: 6 },
-  stat: { fontSize: 11, color: '#555' },
+
+  // Stats Row
+  statsRow: { flexDirection: 'row', justifyContent: 'space-between', marginTop: 12, gap: 8 },
+  statCard: { flex: 1, backgroundColor: '#0a0a0a', borderRadius: 10, paddingVertical: 10, alignItems: 'center', borderWidth: 1, borderColor: '#151515' },
+  statValue: { fontSize: 20, fontWeight: '900', color: '#fff', fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace' },
+  statLabel: { fontSize: 9, color: '#555', marginTop: 2, fontWeight: '600', letterSpacing: 0.5, textTransform: 'uppercase' },
+
+  // Meta Row
+  metaRow: { flexDirection: 'row', justifyContent: 'space-between', marginTop: 8 },
+  metaText: { fontSize: 10, color: '#444' },
 
   // Device List
   list: { padding: 12, paddingBottom: 100 },
 
-  // Device Card
-  card: { borderRadius: 12, padding: 14, marginBottom: 10, borderWidth: 1 },
-  trustedCard: { backgroundColor: '#0a1a0f', borderColor: '#153d20' },
-  intruderCard: { backgroundColor: '#1a0a0a', borderColor: '#3d1515' },
+  // Device Card — Professional Redesign
+  card: { borderRadius: 14, padding: 14, marginBottom: 10, borderWidth: 1 },
+  trustedCard: { backgroundColor: '#081a10', borderColor: '#0d3320' },
+  intruderCard: { backgroundColor: '#1a0a0a', borderColor: '#331515' },
   cardHeader: { flexDirection: 'row', alignItems: 'center' },
-  cardEmoji: { fontSize: 24, marginRight: 10 },
+  cardEmojiWrap: { width: 42, height: 42, borderRadius: 12, backgroundColor: '#111', justifyContent: 'center', alignItems: 'center', marginRight: 12, borderWidth: 1, borderColor: '#1a1a1a' },
+  cardEmoji: { fontSize: 22 },
   cardInfo: { flex: 1 },
-  cardIP: { fontSize: 15, fontWeight: '700', color: '#eee', fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace' },
-  cardType: { fontSize: 10, color: '#777', marginTop: 2 },
-  trustBtn: { padding: 7, borderRadius: 8, borderWidth: 1 },
+  cardName: { fontSize: 15, fontWeight: '800', color: '#f0f0f0', letterSpacing: 0.3 },
+  cardType: { fontSize: 10, color: '#666', marginTop: 2 },
+  trustBtn: { padding: 8, borderRadius: 10, borderWidth: 1 },
   trustedBtnBg: { backgroundColor: '#0a2818', borderColor: '#1a5030' },
   untrustedBtnBg: { backgroundColor: '#280a0a', borderColor: '#501515' },
   trustBtnText: { fontSize: 16 },
-  cardDetails: { marginTop: 8, paddingTop: 8, borderTopWidth: 1, borderTopColor: '#151515' },
-  cardMAC: { fontSize: 10, color: '#444', fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace' },
-  cardVendor: { fontSize: 10, color: '#666', marginTop: 2 },
-  cardFooter: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginTop: 8 },
-  badge: { fontSize: 10, fontWeight: '700', paddingHorizontal: 8, paddingVertical: 3, borderRadius: 6, overflow: 'hidden' },
-  trustedBadge: { color: '#00ff88', backgroundColor: '#0a2a14' },
-  intruderBadge: { color: '#ff4444', backgroundColor: '#2a0a0a' },
-  hintText: { fontSize: 9, color: '#333', fontStyle: 'italic' },
+  cardDetails: { marginTop: 10, paddingTop: 10, borderTopWidth: 1, borderTopColor: '#151515' },
+  cardDetailRow: { flexDirection: 'row', justifyContent: 'space-between', marginBottom: 4 },
+  cardDetailLabel: { fontSize: 10, color: '#555', fontWeight: '600', textTransform: 'uppercase', letterSpacing: 0.5 },
+  cardDetailValue: { fontSize: 10, color: '#888', fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace' },
+  cardFooter: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginTop: 10 },
+  badge: { paddingHorizontal: 10, paddingVertical: 4, borderRadius: 6 },
+  badgeText: { fontSize: 10, fontWeight: '700' },
+  trustedBadge: { backgroundColor: '#0a2a14' },
+  intruderBadge: { backgroundColor: '#2a0a0a' },
+  hintText: { fontSize: 8, color: '#333', fontStyle: 'italic' },
 
   // Skeleton Loader
   skeletonContainer: { padding: 20, alignItems: 'center' },
   scanningTitle: { color: '#00ff88', fontSize: 18, fontWeight: '700', marginBottom: 4 },
   scanningHint: { color: '#555', fontSize: 12, marginBottom: 20 },
-  skeletonCard: { width: '100%', backgroundColor: '#111', borderRadius: 12, padding: 16, marginBottom: 10, borderWidth: 1, borderColor: '#1a1a1a' },
+  skeletonCard: { width: '100%', backgroundColor: '#0a0a0a', borderRadius: 14, padding: 16, marginBottom: 10, borderWidth: 1, borderColor: '#151515' },
   skeletonRow: { flexDirection: 'row', alignItems: 'center' },
-  skeletonCircle: { width: 36, height: 36, borderRadius: 18, backgroundColor: '#1a1a1a', marginRight: 12 },
+  skeletonCircle: { width: 42, height: 42, borderRadius: 12, backgroundColor: '#151515', marginRight: 12 },
   skeletonLines: { flex: 1 },
-  skeletonLine: { height: 10, borderRadius: 4, backgroundColor: '#1a1a1a' },
+  skeletonLine: { height: 10, borderRadius: 4, backgroundColor: '#151515' },
 
   // Empty State
   emptyState: { alignItems: 'center', paddingTop: 80 },
@@ -713,23 +1007,78 @@ const styles = StyleSheet.create({
   settingsLinkText: { color: '#666', fontSize: 13 },
 
   // Buttons
-  buttonRow: { flexDirection: 'row', padding: 16, paddingBottom: Platform.OS === 'ios' ? 30 : 16, gap: 10, backgroundColor: '#050505', borderTopWidth: 1, borderTopColor: '#151515' },
-  scanBtn: { flex: 1, backgroundColor: '#00cc66', paddingVertical: 14, borderRadius: 10, alignItems: 'center' },
+  buttonRow: { flexDirection: 'row', padding: 16, paddingBottom: Platform.OS === 'ios' ? 30 : 16, gap: 10, backgroundColor: '#050505', borderTopWidth: 1, borderTopColor: '#111' },
+  scanBtn: { flex: 1, backgroundColor: '#00cc66', paddingVertical: 14, borderRadius: 12, alignItems: 'center' },
   scanBtnDisabled: { backgroundColor: '#003d1f' },
-  scanBtnText: { color: '#000', fontSize: 15, fontWeight: '800', letterSpacing: 1 },
-  reportBtn: { width: 52, backgroundColor: '#111', paddingVertical: 14, borderRadius: 10, alignItems: 'center', borderWidth: 1, borderColor: '#222' },
+  scanBtnText: { color: '#000', fontSize: 15, fontWeight: '900', letterSpacing: 1 },
+  reportBtn: { width: 52, backgroundColor: '#0a0a0a', paddingVertical: 14, borderRadius: 12, alignItems: 'center', borderWidth: 1, borderColor: '#1a1a1a' },
   reportBtnText: { fontSize: 20 },
 
   // Settings Modal
   modalOverlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.85)', justifyContent: 'center', alignItems: 'center', padding: 20 },
-  modalContent: { width: '100%', backgroundColor: '#111', borderRadius: 16, padding: 24, borderWidth: 1, borderColor: '#222' },
+  modalContent: { width: '100%', backgroundColor: '#0d0d0d', borderRadius: 18, padding: 24, borderWidth: 1, borderColor: '#1a1a1a' },
   modalTitle: { color: '#fff', fontSize: 20, fontWeight: '800', marginBottom: 16 },
   modalLabel: { color: '#888', fontSize: 13, marginBottom: 6 },
-  modalInput: { backgroundColor: '#0a0a0a', color: '#00ff88', fontSize: 15, padding: 14, borderRadius: 10, borderWidth: 1, borderColor: '#222', fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace' },
+  modalInput: { backgroundColor: '#070707', color: '#00ff88', fontSize: 15, padding: 14, borderRadius: 12, borderWidth: 1, borderColor: '#1a1a1a', fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace' },
   modalHint: { color: '#444', fontSize: 11, marginTop: 8, fontStyle: 'italic' },
   modalButtons: { flexDirection: 'row', justifyContent: 'flex-end', marginTop: 20, gap: 10 },
-  modalCancel: { paddingVertical: 10, paddingHorizontal: 20, borderRadius: 8, backgroundColor: '#1a1a1a' },
+  modalCancel: { paddingVertical: 10, paddingHorizontal: 20, borderRadius: 10, backgroundColor: '#151515' },
   modalCancelText: { color: '#888', fontSize: 14, fontWeight: '600' },
-  modalSave: { paddingVertical: 10, paddingHorizontal: 24, borderRadius: 8, backgroundColor: '#00cc66' },
+  modalSave: { paddingVertical: 10, paddingHorizontal: 24, borderRadius: 10, backgroundColor: '#00cc66' },
   modalSaveText: { color: '#000', fontSize: 14, fontWeight: '800' },
+
+  // ══ Device Detail Modal ══
+  detailOverlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.92)', justifyContent: 'flex-end' },
+  detailContainer: { backgroundColor: '#0a0a0a', borderTopLeftRadius: 24, borderTopRightRadius: 24, maxHeight: '90%', borderWidth: 1, borderColor: '#1a1a1a', borderBottomWidth: 0 },
+  detailHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', padding: 20, paddingBottom: 12, borderBottomWidth: 1, borderBottomColor: '#151515' },
+  detailHeaderLeft: { flexDirection: 'row', alignItems: 'center', flex: 1 },
+  detailEmoji: { fontSize: 32, marginRight: 14 },
+  detailName: { fontSize: 18, fontWeight: '900', color: '#f0f0f0', letterSpacing: 0.3 },
+  detailType: { fontSize: 11, color: '#666', marginTop: 2 },
+  detailCloseBtn: { width: 32, height: 32, borderRadius: 16, backgroundColor: '#151515', justifyContent: 'center', alignItems: 'center' },
+  detailCloseBtnText: { color: '#666', fontSize: 16, fontWeight: '700' },
+  detailScroll: { padding: 20 },
+  detailStatusRow: { flexDirection: 'row', gap: 10, marginBottom: 20 },
+  detailBadge: { paddingHorizontal: 14, paddingVertical: 6, borderRadius: 8 },
+  detailSection: { marginBottom: 24 },
+  detailSectionTitle: { color: '#444', fontSize: 10, fontWeight: '800', letterSpacing: 1.5, textTransform: 'uppercase', marginBottom: 12 },
+  detailInfoGrid: {},
+  detailLoadingRow: { flexDirection: 'row', alignItems: 'center', gap: 10, paddingVertical: 8 },
+  detailLoadingText: { color: '#666', fontSize: 12 },
+  detailPortCount: { color: '#888', fontSize: 12, marginBottom: 8 },
+  detailMuted: { color: '#444', fontSize: 12, fontStyle: 'italic' },
+
+  // Info Rows
+  infoRow: { flexDirection: 'row', justifyContent: 'space-between', paddingVertical: 8, borderBottomWidth: 1, borderBottomColor: '#111' },
+  infoLabel: { color: '#555', fontSize: 12, fontWeight: '600' },
+  infoValue: { color: '#ccc', fontSize: 12, fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace', maxWidth: '60%', textAlign: 'right' },
+
+  // Port Rows
+  portRow: { flexDirection: 'row', alignItems: 'center', paddingVertical: 6 },
+  portDot: { width: 6, height: 6, borderRadius: 3, backgroundColor: '#ffaa00', marginRight: 10 },
+  portNumber: { color: '#ffaa00', fontSize: 13, fontWeight: '700', fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace', marginRight: 10 },
+  portBanner: { color: '#666', fontSize: 11 },
+
+  // History Rows
+  historyRow: { flexDirection: 'row', alignItems: 'center', paddingVertical: 8, borderBottomWidth: 1, borderBottomColor: '#111' },
+  historyDot: { width: 8, height: 8, borderRadius: 4, backgroundColor: '#1a5030', marginRight: 12 },
+  historyIP: { color: '#ccc', fontSize: 12, fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace' },
+  historyTime: { color: '#555', fontSize: 10, marginTop: 2 },
+  historyStatus: { fontSize: 10, fontWeight: '700', textTransform: 'uppercase', letterSpacing: 0.5 },
+
+  // Detail Actions
+  detailActions: { flexDirection: 'row', gap: 10, padding: 20, paddingBottom: Platform.OS === 'ios' ? 36 : 20, borderTopWidth: 1, borderTopColor: '#151515' },
+  detailActionBtn: { flex: 1, paddingVertical: 14, borderRadius: 12, alignItems: 'center' },
+  detailActionPrimary: { backgroundColor: '#00cc66' },
+  detailActionDanger: { backgroundColor: '#cc3333' },
+  detailActionSecondary: { backgroundColor: '#151515', borderWidth: 1, borderColor: '#222' },
+  detailActionBtnText: { color: '#fff', fontSize: 13, fontWeight: '800' },
+
+  // Traffic Row
+  trafficRow: { flexDirection: 'row', justifyContent: 'space-around', alignItems: 'center', marginTop: 10, backgroundColor: '#0a0a0a', borderRadius: 10, paddingVertical: 10, paddingHorizontal: 8, borderWidth: 1, borderColor: '#151515' },
+  trafficItem: { alignItems: 'center', flex: 1 },
+  trafficIcon: { fontSize: 14, marginBottom: 2 },
+  trafficValue: { color: '#00ccff', fontSize: 14, fontWeight: '800', fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace' },
+  trafficLabel: { color: '#555', fontSize: 8, fontWeight: '700', letterSpacing: 1, textTransform: 'uppercase', marginTop: 2 },
+  trafficDivider: { width: 1, height: 28, backgroundColor: '#1a1a1a' },
 });

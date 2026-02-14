@@ -184,6 +184,8 @@ class TrafficMonitor(threading.Thread):
             self.stop()
 
     def stop(self):
+        if self.stop_event.is_set():
+            return  # Already stopped
         logging.info("Stopping TrafficMonitor...")
         self.stop_event.set()
         time.sleep(1) # Give threads time to notice
