@@ -9,47 +9,60 @@ import urllib.request
 import base64
 import urllib.error
 
-def scan_network():
-    """ 
-    Robust ARP scan that detects OS (Linux vs MacOS) 
-    and parses 'arp -a' correctly for both.
-    """
-    devices = []
-    try:
-        # Detect OS
-        os_type = platform.system()
-        args = ["arp", "-a"]
-        
-        # Execute command
-        raw_output = subprocess.check_output(args).decode("utf-8")
-        
-        for line in raw_output.split('\n'):
-            ip = None
-            mac = None
-            
-            if os_type == "Darwin": # macOS
-                # Format: ? (192.168.1.1) at 00:11:22:33:44:55 on en0 ...
-                match = re.search(r'\((.*?)\) at (.*?) on', line)
-                if match:
-                    ip, mac = match.group(1), match.group(2)
-            else: # Linux / Windows (Assuming Linux-like output for generic container)
-                # Format: ? (192.168.1.1) at 00:11:22:33:44:55 [ether] on eth0
-                match = re.search(r'\((.*?)\) at (.*?) \[', line)
-                if not match:
-                    # Alternative Linux format: 192.168.1.1 at 00:11...
-                    parts = line.split()
-                    if len(parts) >= 4:
-                        ip = parts[1].strip('()')
-                        mac = parts[3]
-                else:
-                    ip, mac = match.group(1), match.group(2)
+from scapy.all import ARP, Ether, srp
 
-            if ip and mac and "incomplete" not in mac:
-                devices.append({"ip": ip, "mac": mac, "status": "online"})
-                
+def scan_network(target_ip="192.168.1.0/24"):
+    """
+    Active ARP Scan using Scapy.
+    Falls back to passive 'arp -a' if active scan fails (e.g. no root).
+    """
+    try:
+        # 1. Try Active ARP Request
+        arp = ARP(pdst=target_ip)
+        ether = Ether(dst="ff:ff:ff:ff:ff:ff")
+        packet = ether/arp
+        result = srp(packet, timeout=2, verbose=0)[0]
+
+        devices = []
+        for sent, received in result:
+            devices.append({
+                "ip": received.psrc,
+                "mac": received.hwsrc,
+                "status": "online"
+            })
         return devices
-    except Exception as e:
-        return {"error": str(e)}
+
+    except Exception as active_err:
+        # Fallback to passive ARP scan if active fails
+        try:
+            os_type = platform.system()
+            args = ["arp", "-a"]
+            raw_output = subprocess.check_output(args).decode("utf-8")
+            
+            devices = []
+            for line in raw_output.split('\n'):
+                ip = None
+                mac = None
+                
+                if os_type == "Darwin": # macOS
+                    match = re.search(r'\((.*?)\) at (.*?) on', line)
+                    if match:
+                        ip, mac = match.group(1), match.group(2)
+                else: # Linux / Windows
+                    match = re.search(r'\((.*?)\) at (.*?) \[', line)
+                    if not match:
+                        parts = line.split()
+                        if len(parts) >= 4:
+                            ip = parts[1].strip('()')
+                            mac = parts[3]
+                    else:
+                        ip, mac = match.group(1), match.group(2)
+
+                if ip and mac and "incomplete" not in mac:
+                    devices.append({"ip": ip, "mac": mac, "status": "online (passive)"})
+            return devices
+        except Exception as passive_err:
+            return {"error": f"Active scan failed ({str(active_err)}) and Passive scan failed ({str(passive_err)})"}
 
 def deep_scan(target_ip):
     """ Checks for common open ports and hostname """

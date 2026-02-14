@@ -11,11 +11,13 @@ import {
   ActivityIndicator,
   Share
 } from 'react-native';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 
 interface Device {
   ip: string;
   mac: string;
   status: string;
+  vendor?: string;
 }
 
 interface HoneypotLog {
@@ -34,16 +36,20 @@ export default function App() {
     ? 'http://10.0.2.2:3000'
     : 'http://localhost:3000';
 
-  // 🧠 ENHANCED VENDOR DB
-  const getDeviceName = (mac: string) => {
-    const cleanMac = mac.toLowerCase();
-    if (cleanMac.startsWith("6c")) return " Apple Device";
-    if (cleanMac.startsWith("ba")) return "🤖 Android Phone";
-    if (cleanMac.startsWith("1:0")) return "🌐 Gateway Router";
-    if (cleanMac.startsWith("00:50")) return "🎮 PlayStation";
-    if (cleanMac.startsWith("a4")) return "📺 LG Smart TV";
-    return "Unknown Device";
-  };
+  // Load trusted MACs on startup
+  useEffect(() => {
+    const loadTrusted = async () => {
+      try {
+        const stored = await AsyncStorage.getItem('trusted_macs');
+        if (stored) setTrustedMacs(JSON.parse(stored));
+      } catch (e) {
+        console.error("Failed to load trusted devices");
+      }
+    };
+    loadTrusted();
+  }, []);
+
+
 
   const fetchScan = async () => {
     setLoading(true);
@@ -100,22 +106,16 @@ export default function App() {
     }
   };
 
-  const toggleTrust = (mac: string) => {
+  const toggleTrust = async (mac: string) => {
+    let newTrusted;
     if (trustedMacs.includes(mac)) {
-      setTrustedMacs(trustedMacs.filter(id => id !== mac)); // Untrust
+      newTrusted = trustedMacs.filter(id => id !== mac); // Untrust
     } else {
-      Alert.alert(
-        "Trust Device?",
-        "Do you want to mark this device as safe?",
-        [
-          { text: "Cancel", style: "cancel" },
-          {
-            text: "Mark as Safe",
-            onPress: () => setTrustedMacs([...trustedMacs, mac])
-          }
-        ]
-      );
+      newTrusted = [...trustedMacs, mac];
     }
+
+    setTrustedMacs(newTrusted);
+    await AsyncStorage.setItem('trusted_macs', JSON.stringify(newTrusted));
   };
 
   // 📄 REPORT GENERATION
@@ -125,8 +125,8 @@ export default function App() {
 
     report += `--- DEVICE LIST (${devices.length}) ---\n`;
     devices.forEach(d => {
-      const name = getDeviceName(d.mac);
-      const isTrusted = trustedMacs.includes(d.mac) || name.includes("Router");
+      const name = d.vendor || "Unknown Device";
+      const isTrusted = trustedMacs.includes(d.mac);
       report += `[${isTrusted ? "SAFE" : "UNAUTHORIZED"}] ${d.ip} - ${name}\n`;
     });
 
@@ -182,8 +182,8 @@ export default function App() {
           keyExtractor={(item) => item.mac}
           extraData={trustedMacs}
           renderItem={({ item }) => {
-            const name = getDeviceName(item.mac);
-            const isTrusted = trustedMacs.includes(item.mac) || name.includes("Router");
+            const name = item.vendor || "Unknown Device";
+            const isTrusted = trustedMacs.includes(item.mac);
             const isIntruder = !isTrusted;
 
             return (

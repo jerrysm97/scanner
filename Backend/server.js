@@ -3,19 +3,40 @@ const { exec } = require('child_process');
 const cors = require('cors');
 const app = express();
 
+const macLookup = require('mac-lookup');
+
+// Helper to load the vendor database
+macLookup.rebuild(); // downloads latest OUI database
+
 app.use(cors()); // Allow cross-origin requests
 
 // 1. Discovery Scan Endpoint
 app.get('/api/scan', (req, res) => {
     console.log("📡 Scan requested...");
-    exec('python3 ../agent.py', (error, stdout, stderr) => {
+    // Run without sudo; agent.py handles permission fallback
+    exec('python3 ../agent.py', async (error, stdout, stderr) => {
         if (error) {
             console.error(`Exec error: ${error}`);
             return res.status(500).json({ error: "Failed to run scanner" });
         }
 
         try {
-            res.json(JSON.parse(stdout));
+            let scanResults = JSON.parse(stdout);
+
+            // If results are in 'devices' array
+            if (scanResults.devices) {
+                // Enrich data with Vendor Name
+                const enrichedDevices = await Promise.all(scanResults.devices.map(async (device) => {
+                    const vendor = await new Promise(resolve => {
+                        macLookup.get(device.mac, (err, name) => resolve(name || "Unknown Vendor"));
+                    });
+                    return { ...device, vendor };
+                }));
+
+                scanResults.devices = enrichedDevices;
+            }
+
+            res.json(scanResults);
         } catch (parseError) {
             res.json({ raw_output: stdout.trim() });
         }
