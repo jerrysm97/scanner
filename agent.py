@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """
-Sentinel Agent v2.0 — Professional Network Scanner Engine
-=========================================================
-Active ARP scanning via Scapy, multithreaded port scanning,
-risk classification, and credential auditing.
+Sentinel Agent v3.0 — Market-Ready Network Scanner Engine
+==========================================================
+Cross-platform ARP scanning (Windows/macOS/Linux), multithreaded
+port scanning, risk classification, and credential auditing.
+
+NO ROOT / ADMIN REQUIRED — uses native 'arp -a' command.
 
 Usage:
     python3 agent.py                  # Discovery scan (all devices)
@@ -15,7 +17,6 @@ import sys
 import os
 import json
 import socket
-import logging
 import concurrent.futures
 import platform
 import subprocess
@@ -23,15 +24,6 @@ import re
 import urllib.request
 import base64
 import urllib.error
-
-# ── Scapy Setup ──────────────────────────────────────────────────────────────
-# Suppress ALL scapy output so only clean JSON hits stdout
-logging.getLogger("scapy.runtime").setLevel(logging.ERROR)
-logging.getLogger("scapy.interactive").setLevel(logging.ERROR)
-logging.getLogger("scapy.loading").setLevel(logging.ERROR)
-
-from scapy.all import ARP, Ether, srp, conf
-conf.verb = 0  # Silence scapy globally
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -48,7 +40,6 @@ def get_local_subnet():
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.settimeout(0)
         try:
-            # Doesn't actually send data — just selects the right interface
             s.connect(("10.254.254.254", 1))
             local_ip = s.getsockname()[0]
         except Exception:
@@ -57,13 +48,11 @@ def get_local_subnet():
             s.close()
 
         if local_ip.startswith("127."):
-            # Try platform-specific fallback
             local_ip = _fallback_local_ip()
 
         if local_ip.startswith("127.") or local_ip == "0.0.0.0":
             return "192.168.1.0/24"
 
-        # Build /24 subnet
         octets = local_ip.rsplit(".", 1)
         return f"{octets[0]}.0/24"
     except Exception:
@@ -86,93 +75,115 @@ def _fallback_local_ip():
             ).decode().strip().split()[0]
             if out:
                 return out
+        elif os_type == "Windows":
+            out = subprocess.check_output(
+                ["ipconfig"], stderr=subprocess.DEVNULL
+            ).decode()
+            match = re.search(r"IPv4 Address[.\s]*:\s*([\d.]+)", out)
+            if match:
+                return match.group(1)
     except Exception:
         pass
     return "127.0.0.1"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  2. NETWORK DISCOVERY (Active ARP Scan)
+#  2. NETWORK DISCOVERY (Cross-Platform ARP Scan — NO ROOT NEEDED)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def scan_network():
     """
-    Active ARP broadcast scan via Scapy.
-    Discovers ALL devices on the local subnet — not just those in the cache.
-    Falls back to passive 'arp -a' if not running as root.
+    Cross-platform ARP cache scan using 'arp -a'.
+    Detects the OS and uses the correct regex pattern for each.
+
+    Windows:  192.168.1.1   aa-bb-cc-dd-ee-ff   dynamic
+    macOS:    ? (192.168.1.1) at aa:bb:cc:dd:ee:ff on en0
+    Linux:    ? (192.168.1.1) at aa:bb:cc:dd:ee:ff [ether] on eth0
     """
-    target_range = get_local_subnet()
-    scan_mode = "active"
+    os_type = platform.system()
+    _log_stderr(f"🖥️  Detected OS: {os_type}")
 
     try:
-        # ── Active Scan (requires root/admin) ────────────────────────────
-        arp_request = ARP(pdst=target_range)
-        broadcast = Ether(dst="ff:ff:ff:ff:ff:ff")
-        packet = broadcast / arp_request
+        if os_type == "Windows":
+            raw = subprocess.check_output(
+                ["arp", "-a"], stderr=subprocess.DEVNULL, timeout=10
+            ).decode("utf-8", errors="ignore")
+        else:
+            raw = subprocess.check_output(
+                ["arp", "-a"], stderr=subprocess.DEVNULL, timeout=10
+            ).decode("utf-8", errors="ignore")
+    except subprocess.TimeoutExpired:
+        _log_stderr("❌ ARP command timed out.")
+        return [], "timeout"
+    except FileNotFoundError:
+        _log_stderr("❌ 'arp' command not found on this system.")
+        return [], "error"
+    except Exception as e:
+        _log_stderr(f"❌ ARP scan failed: {e}")
+        return [], "error"
 
-        answered, _ = srp(packet, timeout=3, verbose=0)
+    devices = []
+    seen_macs = set()
 
-        devices = []
-        seen_macs = set()
-        for sent, received in answered:
-            mac = received.hwsrc.lower()
+    for line in raw.splitlines():
+        ip, mac = None, None
+
+        if os_type == "Windows":
+            # Windows format: "  192.168.1.1     aa-bb-cc-dd-ee-ff     dynamic"
+            m = re.search(
+                r"((?:\d{1,3}\.){3}\d{1,3})\s+"
+                r"([0-9a-fA-F]{2}-[0-9a-fA-F]{2}-[0-9a-fA-F]{2}-"
+                r"[0-9a-fA-F]{2}-[0-9a-fA-F]{2}-[0-9a-fA-F]{2})",
+                line
+            )
+            if m:
+                ip = m.group(1)
+                mac = m.group(2).replace("-", ":").lower()
+
+        elif os_type == "Darwin":
+            # macOS format: "? (192.168.1.1) at aa:bb:cc:dd:ee:ff on en0 ..."
+            m = re.search(
+                r"\((\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\)\s+at\s+"
+                r"([0-9a-fA-F:]+)\s+on",
+                line
+            )
+            if m:
+                ip = m.group(1)
+                mac = m.group(2).lower()
+
+        else:
+            # Linux format: "? (192.168.1.1) at aa:bb:cc:dd:ee:ff [ether] on eth0"
+            m = re.search(
+                r"\((\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\)\s+at\s+"
+                r"([0-9a-fA-F:]+)",
+                line
+            )
+            if not m:
+                # Fallback: try space-delimited fields
+                parts = line.split()
+                if len(parts) >= 4:
+                    candidate_ip = parts[1].strip("()")
+                    candidate_mac = parts[3]
+                    if re.match(r"\d+\.\d+\.\d+\.\d+", candidate_ip) and ":" in candidate_mac:
+                        ip = candidate_ip
+                        mac = candidate_mac.lower()
+            else:
+                ip = m.group(1)
+                mac = m.group(2).lower()
+
+        # Skip incomplete or broadcast entries
+        if ip and mac and "incomplete" not in mac and "ff:ff:ff:ff:ff:ff" not in mac:
             if mac not in seen_macs:
                 seen_macs.add(mac)
                 devices.append({
-                    "ip": received.psrc,
-                    "mac": mac,
-                    "status": "online",
-                    "scan_mode": "active"
-                })
-        return devices, scan_mode
-
-    except PermissionError:
-        scan_mode = "passive"
-        _log_stderr("⚠️  Active scanning requires root privileges. Falling back to passive scan.")
-        _log_stderr("    Run with: sudo python3 agent.py")
-        return _passive_arp_scan(), scan_mode
-
-    except Exception as e:
-        scan_mode = "passive"
-        _log_stderr(f"⚠️  Active scan failed ({type(e).__name__}: {e}). Trying passive scan...")
-        return _passive_arp_scan(), scan_mode
-
-
-def _passive_arp_scan():
-    """Fallback: parse the OS ARP cache with 'arp -a'."""
-    try:
-        raw = subprocess.check_output(["arp", "-a"], stderr=subprocess.DEVNULL).decode("utf-8")
-        devices = []
-        os_type = platform.system()
-
-        for line in raw.splitlines():
-            ip, mac = None, None
-
-            if os_type == "Darwin":
-                m = re.search(r"\(([\d.]+)\)\s+at\s+([\w:]+)\s+on", line)
-                if m:
-                    ip, mac = m.group(1), m.group(2)
-            else:
-                m = re.search(r"\(([\d.]+)\)\s+at\s+([\w:]+)", line)
-                if not m:
-                    parts = line.split()
-                    if len(parts) >= 4:
-                        ip = parts[1].strip("()")
-                        mac = parts[3]
-                else:
-                    ip, mac = m.group(1), m.group(2)
-
-            if ip and mac and "incomplete" not in mac.lower():
-                devices.append({
                     "ip": ip,
-                    "mac": mac.lower(),
+                    "mac": mac,
                     "status": "online",
                     "scan_mode": "passive"
                 })
-        return devices
-    except Exception as e:
-        _log_stderr(f"❌ Passive scan also failed: {e}")
-        return []
+
+    _log_stderr(f"📡 Found {len(devices)} device(s) on the network.")
+    return devices, "passive"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -209,13 +220,12 @@ HIGH_RISK_PORTS = {21, 22, 3389, 445}   # FTP, SSH, RDP, SMB
 
 
 def _check_port(ip, port):
-    """Probe a single TCP port. Returns (port, banner) or None."""
+    """Probe a single TCP port with 0.5s timeout. Returns (port, banner) or None."""
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(0.8)
+        sock.settimeout(0.5)
         result = sock.connect_ex((ip, port))
         if result == 0:
-            # Try to grab a banner
             banner = ""
             try:
                 sock.send(b"\r\n")
@@ -246,12 +256,12 @@ def _classify_risk(open_ports):
 def deep_scan(target_ip):
     """
     Professional port scan: 20 threads, top 20 ports, banner grabbing,
-    risk classification.
+    risk classification. Uses 0.5s timeout per port.
     """
     # 1. Hostname resolution
     try:
         hostname = socket.gethostbyaddr(target_ip)[0]
-    except socket.herror:
+    except (socket.herror, socket.gaierror, OSError):
         hostname = "Unknown"
 
     # 2. Parallel port scan with 20 threads
@@ -262,9 +272,12 @@ def deep_scan(target_ip):
             for port in TOP_PORTS
         }
         for future in concurrent.futures.as_completed(futures):
-            result = future.result()
-            if result:
-                open_ports.append(result)
+            try:
+                result = future.result(timeout=5)
+                if result:
+                    open_ports.append(result)
+            except Exception:
+                pass
 
     open_ports.sort(key=lambda p: p["port"])
 
@@ -295,7 +308,11 @@ DEFAULT_CREDENTIALS = [
 
 
 def audit_credentials(target_ip):
-    """Check a device for common default HTTP Basic Auth credentials."""
+    """
+    Check a device for common default HTTP Basic Auth credentials.
+    Uses urllib to attempt login to http://<ip> with each credential pair.
+    Returns VULNERABLE (200 OK) or SECURE (401 Unauthorized / connection refused).
+    """
     url = f"http://{target_ip}"
     results = []
 
@@ -317,6 +334,7 @@ def audit_credentials(target_ip):
                     "credential": f"{username}:{password}",
                     "status": "REJECTED"
                 })
+            # Other HTTP errors = skip
         except Exception:
             pass  # Connection refused / timeout — no HTTP server
 
@@ -373,7 +391,6 @@ if __name__ == "__main__":
 
         else:
             # Deep scan a specific IP
-            # Validate IP format
             ip_pattern = re.compile(r"^(?:\d{1,3}\.){3}\d{1,3}$")
             if ip_pattern.match(command):
                 print(json.dumps(deep_scan(command)))

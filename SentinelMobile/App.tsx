@@ -1,4 +1,20 @@
-import React, { useState, useEffect, useCallback } from 'react';
+/**
+ * ═══════════════════════════════════════════════════════════════════════════════
+ *  Sentinel Mobile v3.0 — Production-Ready React Native App
+ * ═══════════════════════════════════════════════════════════════════════════════
+ *
+ *  Features:
+ *  ► Physical device support (connects via LAN IP)
+ *  ► AsyncStorage persistence for trusted devices
+ *  ► Network scanning with device classification
+ *  ► Deep scan (long-press any device)
+ *  ► Credential audit (tap 🔐 on intruder cards)
+ *  ► Honeypot intrusion detection (polls every 10s)
+ *  ► Security report sharing (via Share API)
+ *  ► Dark theme with animated UI
+ */
+
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
   SafeAreaView,
   StyleSheet,
@@ -11,6 +27,7 @@ import {
   ActivityIndicator,
   Share,
   StatusBar,
+  Animated,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
@@ -21,73 +38,42 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 interface Device {
   ip: string;
   mac: string;
-  status: string;
-  scan_mode?: string;
   vendor?: string;
-  deviceType?: string;
+  type?: string;
+  status?: string;
+  risk?: string;
+  scan_mode?: string;
 }
 
 interface HoneypotLog {
   ip: string;
-  time: string;
-  port?: number;
-}
-
-interface ScanResponse {
-  status: string;
-  scan_mode: string;
-  subnet: string;
-  count: number;
-  is_root: boolean;
   timestamp: string;
-  devices: Device[];
+  port: number;
+  message: string;
+}
+
+interface DeepScanResult {
+  ip: string;
+  hostname: string;
+  open_ports: { port: number; banner: string }[];
+  port_count: number;
+  risk_level: string;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-//  DEVICE ICON RESOLVER
-// ═══════════════════════════════════════════════════════════════════════════════
-
-function getDeviceIcon(deviceType?: string): string {
-  switch (deviceType) {
-    case 'mobile': return '📱';
-    case 'desktop': return '🖥️';
-    case 'iot': return '📡';
-    case 'network': return '🌐';
-    default: return '❓';
-  }
-}
-
-function getDeviceLabel(deviceType?: string): string {
-  switch (deviceType) {
-    case 'mobile': return 'MOBILE';
-    case 'desktop': return 'DESKTOP';
-    case 'iot': return 'IoT DEVICE';
-    case 'network': return 'NETWORK';
-    default: return 'UNKNOWN';
-  }
-}
-
-function getRiskColor(risk?: string): string {
-  switch (risk) {
-    case 'CRITICAL': return '#FF2D55';
-    case 'HIGH': return '#FF453A';
-    case 'MEDIUM': return '#FF9F0A';
-    case 'LOW': return '#30D158';
-    default: return '#8E8E93';
-  }
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-//  STORAGE KEYS
+//  CONSTANTS
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const STORAGE_KEYS = {
   TRUSTED_MACS: '@sentinel_trusted_macs',
-  LAST_SCAN: '@sentinel_last_scan_time',
+  LAST_SCAN: '@sentinel_last_scan',
+  DEVICES: '@sentinel_devices',
 };
 
+const HONEYPOT_POLL_INTERVAL = 10000; // 10 seconds
+
 // ═══════════════════════════════════════════════════════════════════════════════
-//  MAIN APP
+//  APP COMPONENT
 // ═══════════════════════════════════════════════════════════════════════════════
 
 export default function App() {
@@ -99,21 +85,30 @@ export default function App() {
   const [scanMode, setScanMode] = useState<string>('—');
   const [subnet, setSubnet] = useState<string>('—');
 
+  // Banner animation
+  const bannerAnim = useRef(new Animated.Value(0)).current;
+
   // ── Connection ──────────────────────────────────────────────────────────────
+  // Use your computer's LAN IP so physical phones can reach the backend.
+  // Emulator uses 10.0.2.2 to reach the host machine.
   const BASE_URL = Platform.OS === 'android'
-    ? 'http://10.0.2.2:3000'
+    ? __DEV__
+      ? 'http://192.168.1.103:3000'   // Physical phone or emulator on same LAN
+      : 'http://192.168.1.103:3000'
     : 'http://localhost:3000';
 
   // ── Load persisted data on startup ──────────────────────────────────────────
   useEffect(() => {
     const loadPersistedData = async () => {
       try {
-        const [storedMacs, storedTime] = await Promise.all([
+        const [storedMacs, storedTime, storedDevices] = await Promise.all([
           AsyncStorage.getItem(STORAGE_KEYS.TRUSTED_MACS),
           AsyncStorage.getItem(STORAGE_KEYS.LAST_SCAN),
+          AsyncStorage.getItem(STORAGE_KEYS.DEVICES),
         ]);
         if (storedMacs) setTrustedMacs(JSON.parse(storedMacs));
         if (storedTime) setLastScanTime(storedTime);
+        if (storedDevices) setDevices(JSON.parse(storedDevices));
       } catch (e) {
         console.error('Failed to load persisted data:', e);
       }
@@ -121,271 +116,339 @@ export default function App() {
     loadPersistedData();
   }, []);
 
+  // ── Honeypot Polling — every 10 seconds ─────────────────────────────────────
+  useEffect(() => {
+    const pollHoneypot = async () => {
+      try {
+        const resp = await fetch(`${BASE_URL}/api/honeypot`);
+        const logs: HoneypotLog[] = await resp.json();
+        setHoneypotLogs(logs);
+
+        // Animate banner in/out
+        Animated.timing(bannerAnim, {
+          toValue: logs.length > 0 ? 1 : 0,
+          duration: 300,
+          useNativeDriver: false,
+        }).start();
+      } catch {
+        // Server not reachable — ignore
+      }
+    };
+
+    pollHoneypot(); // Immediate first poll
+    const interval = setInterval(pollHoneypot, HONEYPOT_POLL_INTERVAL);
+    return () => clearInterval(interval);
+  }, [BASE_URL]);
+
   // ── Network Scan ────────────────────────────────────────────────────────────
   const fetchScan = useCallback(async () => {
     setLoading(true);
     try {
-      const [scanRes, hpRes] = await Promise.all([
-        fetch(`${BASE_URL}/api/scan`),
-        fetch(`${BASE_URL}/api/honeypot`),
-      ]);
+      const response = await fetch(`${BASE_URL}/api/scan`);
+      const data = await response.json();
 
-      const scanData: ScanResponse = await scanRes.json();
-      const hpData: HoneypotLog[] = await hpRes.json();
+      if (data.devices && data.devices.length > 0) {
+        setDevices(data.devices);
+        setScanMode(data.scan_mode || 'passive');
+        setSubnet(data.subnet || '—');
 
-      setDevices(scanData.devices || []);
-      setHoneypotLogs(hpData || []);
-      setScanMode(scanData.scan_mode || 'unknown');
-      setSubnet(scanData.subnet || 'unknown');
+        const now = new Date().toLocaleTimeString();
+        setLastScanTime(now);
 
-      // Persist last scan time
-      const timeStr = new Date().toLocaleString();
-      setLastScanTime(timeStr);
-      await AsyncStorage.setItem(STORAGE_KEYS.LAST_SCAN, timeStr);
-
-    } catch (error) {
+        // Persist scan results
+        await Promise.all([
+          AsyncStorage.setItem(STORAGE_KEYS.LAST_SCAN, now),
+          AsyncStorage.setItem(STORAGE_KEYS.DEVICES, JSON.stringify(data.devices)),
+        ]);
+      } else {
+        Alert.alert('Scan Complete', data.message || 'No devices found.');
+      }
+    } catch (error: any) {
       Alert.alert(
-        '🔴 Connection Error',
-        'Could not connect to Sentinel Backend.\n\nMake sure the server is running:\n  node server.js'
+        '⚠️ Connection Error',
+        `Cannot reach the Sentinel server at:\n${BASE_URL}\n\nMake sure:\n1. Backend is running (node server.js)\n2. Phone and computer are on the same WiFi\n3. IP address is correct`
       );
     } finally {
       setLoading(false);
     }
   }, [BASE_URL]);
 
-  // ── Deep Scan ───────────────────────────────────────────────────────────────
-  const inspectDevice = useCallback(async (ip: string) => {
-    Alert.alert('🕵️ Deep Scan', `Scanning ${ip} for open ports...`);
+  // ── Deep Scan (long-press) ──────────────────────────────────────────────────
+  const deepScan = useCallback(async (ip: string) => {
+    Alert.alert('🔍 Deep Scan', `Scanning ${ip}...\nThis may take a few seconds.`);
+
     try {
       const response = await fetch(`${BASE_URL}/api/inspect?ip=${ip}`);
-      const data = await response.json();
+      const data: DeepScanResult = await response.json();
 
-      const ports = data.open_ports || [];
-      const portList = ports.length > 0
-        ? ports.map((p: any) => `${p.port}${p.banner ? ` (${p.banner.substring(0, 30)})` : ''}`).join('\n')
-        : 'None found';
+      if (data.error) {
+        Alert.alert('Scan Error', data.error);
+        return;
+      }
+
+      const portList = data.open_ports?.length > 0
+        ? data.open_ports.map(p => `  • Port ${p.port}${p.banner ? ` — ${p.banner}` : ''}`).join('\n')
+        : '  None found';
 
       Alert.alert(
-        `🔎 ${data.hostname || ip}`,
-        `Risk: ${data.risk_level || 'N/A'}\n` +
-        `Ports scanned: 20\n` +
-        `Open: ${data.port_count || 0}\n\n` +
-        `${portList}`
+        `🔍 Deep Scan: ${ip}`,
+        `Hostname: ${data.hostname}\n` +
+        `Open Ports (${data.port_count}):\n${portList}\n\n` +
+        `Risk Level: ${riskEmoji(data.risk_level)} ${data.risk_level}`
       );
-    } catch (e) {
-      Alert.alert('Error', 'Deep scan failed.');
+    } catch {
+      Alert.alert('Error', 'Deep scan failed. Is the server running?');
     }
   }, [BASE_URL]);
 
-  // ── Credential Audit ────────────────────────────────────────────────────────
-  const auditDevice = useCallback(async (ip: string) => {
+  // ── Credential Audit (tap 🔐) ──────────────────────────────────────────────
+  const auditCredentials = useCallback(async (ip: string) => {
+    Alert.alert('🔐 Auditing', `Checking default credentials on ${ip}...`);
+
     try {
       const response = await fetch(`${BASE_URL}/api/audit?ip=${ip}`);
       const data = await response.json();
 
       if (data.status === 'VULNERABLE') {
-        const vulnCreds = data.details
-          ?.filter((d: any) => d.status === 'VULNERABLE')
-          .map((d: any) => `  • ${d.credential}`)
-          .join('\n') || '';
+        const creds = data.details
+          .filter((d: any) => d.status === 'VULNERABLE')
+          .map((d: any) => `  ⚠️ ${d.credential}`)
+          .join('\n');
 
         Alert.alert(
-          '🚨 CRITICAL — DEFAULT CREDENTIALS',
-          `${data.message}\n\nAccepted credentials:\n${vulnCreds}\n\nChange these immediately!`
+          '🚨 VULNERABLE!',
+          `Device ${ip} accepts default credentials!\n\n${creds}\n\nChange these passwords immediately!`
         );
       } else {
-        Alert.alert('✅ Secure', data.message || 'No default credentials found.');
+        Alert.alert(
+          '✅ Secure',
+          data.message || `Device ${ip} rejected all default credentials.`
+        );
       }
-    } catch (e) {
-      Alert.alert('Error', 'Credential audit failed.');
+    } catch {
+      Alert.alert('Error', 'Credential audit failed. Is the server running?');
     }
   }, [BASE_URL]);
 
   // ── Trust Toggle ────────────────────────────────────────────────────────────
   const toggleTrust = useCallback(async (mac: string) => {
-    const newTrusted = trustedMacs.includes(mac)
+    const updated = trustedMacs.includes(mac)
       ? trustedMacs.filter(m => m !== mac)
       : [...trustedMacs, mac];
 
-    setTrustedMacs(newTrusted);
+    setTrustedMacs(updated);
+
     try {
-      await AsyncStorage.setItem(STORAGE_KEYS.TRUSTED_MACS, JSON.stringify(newTrusted));
+      await AsyncStorage.setItem(STORAGE_KEYS.TRUSTED_MACS, JSON.stringify(updated));
     } catch (e) {
-      console.error('Failed to persist trusted MACs:', e);
+      console.error('Failed to save trusted devices:', e);
     }
   }, [trustedMacs]);
 
-  // ── Report Generation ──────────────────────────────────────────────────────
+  // ── Generate Security Report ────────────────────────────────────────────────
   const generateReport = useCallback(async () => {
-    const date = new Date().toLocaleString();
-    let report = `🛡️ SENTINEL SECURITY REPORT\n`;
-    report += `Generated: ${date}\n`;
-    report += `Subnet: ${subnet} | Mode: ${scanMode}\n\n`;
+    const trusted = devices.filter(d => trustedMacs.includes(d.mac));
+    const intruders = devices.filter(d => !trustedMacs.includes(d.mac));
 
-    report += `═══ DEVICE LIST (${devices.length}) ═══\n`;
-    devices.forEach(d => {
-      const icon = getDeviceIcon(d.deviceType);
-      const vendor = d.vendor || 'Unknown';
-      const trusted = trustedMacs.includes(d.mac);
-      report += `${icon} [${trusted ? 'TRUSTED' : 'UNKNOWN'}] ${d.ip}\n`;
-      report += `   Vendor: ${vendor} | MAC: ${d.mac}\n\n`;
-    });
+    const report = [
+      `══════════════════════════════════════`,
+      `   🛡️ SENTINEL SECURITY REPORT`,
+      `══════════════════════════════════════`,
+      `📅 Generated: ${new Date().toLocaleString()}`,
+      `📡 Subnet: ${subnet}`,
+      `🔍 Scan Mode: ${scanMode}`,
+      `📊 Total Devices: ${devices.length}`,
+      `✅ Trusted: ${trusted.length}`,
+      `⚠️ Untrusted: ${intruders.length}`,
+      `🪤 Honeypot Triggers: ${honeypotLogs.length}`,
+      ``,
+      `── Trusted Devices ─────────────────`,
+      ...trusted.map(d => `  ✅ ${d.ip} | ${d.mac} | ${d.vendor || 'Unknown'}`),
+      ``,
+      `── Untrusted Devices ───────────────`,
+      ...intruders.map(d => `  ⚠️ ${d.ip} | ${d.mac} | ${d.vendor || 'Unknown'}`),
+    ];
 
     if (honeypotLogs.length > 0) {
-      report += `\n🚨 INTRUSION ATTEMPTS (${honeypotLogs.length}) ═══\n`;
+      report.push(``, `── Honeypot Intrusions ─────────────`);
       honeypotLogs.forEach(log => {
-        report += `[BLOCKED] ${log.ip} at ${log.time}\n`;
+        report.push(`  🪤 ${log.ip} at ${log.timestamp}`);
       });
-    } else {
-      report += `\n✅ No intrusion attempts detected.\n`;
     }
+
+    report.push(``, `══════════════════════════════════════`);
 
     try {
-      await Share.share({ message: report });
+      await Share.share({
+        message: report.join('\n'),
+        title: 'Sentinel Security Report',
+      });
     } catch {
-      Alert.alert('Error', 'Could not export report.');
+      Alert.alert('Error', 'Failed to share report.');
     }
-  }, [devices, honeypotLogs, trustedMacs, scanMode, subnet]);
+  }, [devices, trustedMacs, honeypotLogs, subnet, scanMode]);
 
-  // ── Computed values ─────────────────────────────────────────────────────────
-  const untrustedCount = devices.filter(d => !trustedMacs.includes(d.mac)).length;
+  // ── Helpers ─────────────────────────────────────────────────────────────────
+  const riskEmoji = (level: string) => {
+    switch (level?.toUpperCase()) {
+      case 'CRITICAL': return '🔴';
+      case 'HIGH': return '🟠';
+      case 'MEDIUM': return '🟡';
+      default: return '🟢';
+    }
+  };
 
-  // ═══════════════════════════════════════════════════════════════════════════════
-  //  RENDER
-  // ═══════════════════════════════════════════════════════════════════════════════
+  const typeEmoji = (type: string) => {
+    if (!type) return '📱';
+    const t = type.toLowerCase();
+    if (t.includes('router')) return '🌐';
+    if (t.includes('apple')) return '🍎';
+    if (t.includes('android')) return '📱';
+    if (t.includes('camera')) return '📷';
+    if (t.includes('printer')) return '🖨️';
+    if (t.includes('smart home')) return '🏠';
+    if (t.includes('google')) return '🔵';
+    if (t.includes('raspberry')) return '🍓';
+    if (t.includes('media')) return '📺';
+    if (t.includes('iot')) return '⚡';
+    if (t.includes('pc')) return '💻';
+    return '📱';
+  };
+
+  // ── Render Device Card ──────────────────────────────────────────────────────
+  const renderDevice = ({ item }: { item: Device }) => {
+    const isTrusted = trustedMacs.includes(item.mac);
+    const isIntruder = !isTrusted && devices.length > 0;
+
+    return (
+      <TouchableOpacity
+        style={[
+          styles.card,
+          isTrusted ? styles.trustedCard : styles.intruderCard,
+        ]}
+        onLongPress={() => deepScan(item.ip)}
+        activeOpacity={0.7}
+      >
+        {/* Header */}
+        <View style={styles.cardHeader}>
+          <Text style={styles.cardEmoji}>{typeEmoji(item.type || '')}</Text>
+          <View style={styles.cardInfo}>
+            <Text style={styles.cardIP}>{item.ip}</Text>
+            <Text style={styles.cardType}>{item.type || 'Unknown Device'}</Text>
+          </View>
+          <View style={styles.cardActions}>
+            {/* Credential Audit Button (only for non-trusted) */}
+            {isIntruder && (
+              <TouchableOpacity
+                style={styles.auditBtn}
+                onPress={() => auditCredentials(item.ip)}
+              >
+                <Text style={styles.auditBtnText}>🔐</Text>
+              </TouchableOpacity>
+            )}
+            {/* Trust Toggle */}
+            <TouchableOpacity
+              style={[styles.trustBtn, isTrusted ? styles.trustedBtn : styles.untrustedBtn]}
+              onPress={() => toggleTrust(item.mac)}
+            >
+              <Text style={styles.trustBtnText}>
+                {isTrusted ? '✅' : '❌'}
+              </Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+
+        {/* Details */}
+        <View style={styles.cardDetails}>
+          <Text style={styles.cardMAC}>MAC: {item.mac}</Text>
+          <Text style={styles.cardVendor}>{item.vendor || 'Unknown vendor'}</Text>
+        </View>
+
+        {/* Status Bar */}
+        <View style={styles.cardStatus}>
+          <Text style={[styles.statusBadge, isTrusted ? styles.trustedBadge : styles.intruderBadge]}>
+            {isTrusted ? '✅ TRUSTED' : '⚠️ INTRUDER'}
+          </Text>
+          <Text style={styles.cardHint}>Long press → Deep Scan</Text>
+        </View>
+      </TouchableOpacity>
+    );
+  };
+
+  // ── Main Render ─────────────────────────────────────────────────────────────
+  const bannerHeight = bannerAnim.interpolate({
+    inputRange: [0, 1],
+    outputRange: [0, 60],
+  });
 
   return (
     <SafeAreaView style={styles.container}>
-      <StatusBar barStyle="light-content" backgroundColor="#000" />
+      <StatusBar barStyle="light-content" backgroundColor="#0a0a0a" />
 
-      {/* ── Header ──────────────────────────────────────────────────────── */}
-      <View style={styles.header}>
-        <Text style={styles.title}>🛡️ Sentinel Pro</Text>
-        <Text style={styles.subtitle}>
-          {devices.length} Devices • {untrustedCount} Unknown • {honeypotLogs.length} Intrusions
+      {/* ── Honeypot Intrusion Banner ── */}
+      <Animated.View style={[styles.intrusionBanner, { height: bannerHeight, opacity: bannerAnim }]}>
+        <Text style={styles.intrusionText}>
+          🚨 INTRUSION DETECTED — {honeypotLogs.length} connection(s) on honeypot!
         </Text>
-        {lastScanTime && (
-          <Text style={styles.scanTime}>Last scan: {lastScanTime} • {scanMode.toUpperCase()}</Text>
-        )}
-      </View>
+      </Animated.View>
 
-      {/* ── Honeypot Banner ─────────────────────────────────────────────── */}
-      {honeypotLogs.length > 0 && (
-        <View style={styles.banner}>
-          <Text style={styles.bannerText}>
-            🚨 HONEYPOT TRIGGERED! ({honeypotLogs.length} intrusion{honeypotLogs.length > 1 ? 's' : ''})
+      {/* ── Header ── */}
+      <View style={styles.header}>
+        <Text style={styles.title}>🛡️ SENTINEL</Text>
+        <Text style={styles.subtitle}>Network Security Monitor v3.0</Text>
+        <View style={styles.statsRow}>
+          <Text style={styles.stat}>📡 {subnet}</Text>
+          <Text style={styles.stat}>🔍 {scanMode}</Text>
+          <Text style={styles.stat}>🕐 {lastScanTime || '—'}</Text>
+        </View>
+        <View style={styles.statsRow}>
+          <Text style={styles.stat}>📊 {devices.length} devices</Text>
+          <Text style={styles.stat}>
+            ✅ {devices.filter(d => trustedMacs.includes(d.mac)).length} trusted
+          </Text>
+          <Text style={styles.stat}>
+            ⚠️ {devices.filter(d => !trustedMacs.includes(d.mac)).length} intruders
           </Text>
         </View>
-      )}
+      </View>
 
-      {/* ── Content ─────────────────────────────────────────────────────── */}
-      <View style={styles.content}>
-
-        {/* Action Buttons */}
-        <View style={styles.buttonRow}>
-          <TouchableOpacity
-            style={[styles.scanButton, { flex: 2, marginRight: 10, opacity: loading ? 0.7 : 1 }]}
-            onPress={fetchScan}
-            disabled={loading}
-          >
-            {loading ? (
-              <View style={styles.buttonInner}>
-                <ActivityIndicator color="#FFF" />
-                <Text style={[styles.buttonText, { marginLeft: 10 }]}>SCANNING...</Text>
-              </View>
-            ) : (
-              <Text style={styles.buttonText}>🚀 SCAN NETWORK</Text>
-            )}
-          </TouchableOpacity>
-
-          <TouchableOpacity
-            style={[styles.scanButton, { flex: 1, backgroundColor: '#34C759' }]}
-            onPress={generateReport}
-          >
-            <Text style={styles.buttonText}>📄 REPORT</Text>
-          </TouchableOpacity>
-        </View>
-
-        {/* ── Empty State ──────────────────────────────────────────────── */}
-        {devices.length === 0 && !loading && (
+      {/* ── Device List ── */}
+      <FlatList
+        data={devices}
+        keyExtractor={(item) => item.mac}
+        renderItem={renderDevice}
+        extraData={trustedMacs}
+        contentContainerStyle={styles.list}
+        ListEmptyComponent={
           <View style={styles.emptyState}>
-            <Text style={styles.emptyIcon}>📡</Text>
-            <Text style={styles.emptyTitle}>No Devices Found</Text>
-            <Text style={styles.emptySubtitle}>
-              Tap "SCAN NETWORK" to discover devices on your network.
-            </Text>
+            <Text style={styles.emptyEmoji}>📡</Text>
+            <Text style={styles.emptyText}>No devices scanned yet.</Text>
+            <Text style={styles.emptyHint}>Tap "SCAN NETWORK" to begin.</Text>
           </View>
-        )}
+        }
+      />
 
-        {/* ── Device List ──────────────────────────────────────────────── */}
-        <FlatList
-          data={devices}
-          keyExtractor={(item) => item.mac}
-          extraData={trustedMacs}
-          showsVerticalScrollIndicator={false}
-          renderItem={({ item }) => {
-            const vendor = item.vendor || 'Unknown Device';
-            const isTrusted = trustedMacs.includes(item.mac);
-            const isUnknown = !isTrusted;
-            const deviceIcon = getDeviceIcon(item.deviceType);
-            const deviceLabel = getDeviceLabel(item.deviceType);
+      {/* ── Action Buttons ── */}
+      <View style={styles.buttonRow}>
+        <TouchableOpacity
+          style={[styles.scanBtn, loading && styles.scanBtnDisabled]}
+          onPress={fetchScan}
+          disabled={loading}
+        >
+          {loading ? (
+            <ActivityIndicator color="#fff" size="small" />
+          ) : (
+            <Text style={styles.scanBtnText}>📡 SCAN NETWORK</Text>
+          )}
+        </TouchableOpacity>
 
-            return (
-              <TouchableOpacity
-                activeOpacity={0.6}
-                onPress={() => toggleTrust(item.mac)}
-                onLongPress={() => inspectDevice(item.ip)}
-                delayLongPress={500}
-              >
-                <View style={[styles.card, isUnknown ? styles.intruderCard : styles.safeCard]}>
-
-                  {/* Device Type Icon */}
-                  <View style={styles.iconContainer}>
-                    <Text style={styles.deviceIcon}>{deviceIcon}</Text>
-                    <Text style={styles.typeLabel}>{deviceLabel}</Text>
-                  </View>
-
-                  {/* Device Info */}
-                  <View style={styles.cardBody}>
-                    <View style={styles.cardHeader}>
-                      <View style={styles.statusRow}>
-                        <View style={[styles.statusDot, { backgroundColor: isTrusted ? '#30D158' : '#FF453A' }]} />
-                        <Text style={[styles.statusLabel, { color: isTrusted ? '#30D158' : '#FF453A' }]}>
-                          {isTrusted ? 'TRUSTED' : 'UNKNOWN'}
-                        </Text>
-                      </View>
-
-                      {isUnknown && (
-                        <View style={styles.actionRow}>
-                          <View style={styles.riskBadge}>
-                            <Text style={styles.riskText}>REVIEW</Text>
-                          </View>
-                          <TouchableOpacity
-                            style={styles.keyButton}
-                            onPress={() => auditDevice(item.ip)}
-                          >
-                            <Text style={{ fontSize: 14 }}>🔐</Text>
-                          </TouchableOpacity>
-                        </View>
-                      )}
-                    </View>
-
-                    <Text style={styles.deviceName} numberOfLines={1}>{vendor}</Text>
-                    <Text style={styles.deviceIp}>{item.ip}</Text>
-                    <Text style={styles.macText}>{item.mac}</Text>
-
-                    {isUnknown && (
-                      <Text style={styles.hintText}>Tap to trust • Long press to inspect • 🔐 to audit</Text>
-                    )}
-                    {isTrusted && (
-                      <Text style={[styles.hintText, { color: '#30D158' }]}>Tap to untrust • Long press to inspect</Text>
-                    )}
-                  </View>
-                </View>
-              </TouchableOpacity>
-            );
-          }}
-        />
+        <TouchableOpacity
+          style={styles.reportBtn}
+          onPress={generateReport}
+          disabled={devices.length === 0}
+        >
+          <Text style={styles.reportBtnText}>📋 REPORT</Text>
+        </TouchableOpacity>
       </View>
     </SafeAreaView>
   );
@@ -398,219 +461,226 @@ export default function App() {
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    backgroundColor: '#000000',
+    backgroundColor: '#0a0a0a',
   },
 
-  // Header
+  // ── Intrusion Banner ──
+  intrusionBanner: {
+    backgroundColor: '#dc2626',
+    justifyContent: 'center',
+    alignItems: 'center',
+    overflow: 'hidden',
+  },
+  intrusionText: {
+    color: '#fff',
+    fontSize: 14,
+    fontWeight: '800',
+    letterSpacing: 0.5,
+  },
+
+  // ── Header ──
   header: {
     padding: 20,
-    paddingTop: Platform.OS === 'android' ? 50 : 60,
-    backgroundColor: '#0D0D0D',
+    paddingBottom: 12,
     borderBottomWidth: 1,
-    borderBottomColor: '#1C1C1E',
+    borderBottomColor: '#1a1a1a',
   },
   title: {
-    fontSize: 32,
+    fontSize: 28,
     fontWeight: '900',
-    color: '#FFFFFF',
-    letterSpacing: 0.5,
+    color: '#00ff88',
+    letterSpacing: 2,
   },
   subtitle: {
-    color: '#8E8E93',
-    marginTop: 4,
-    fontSize: 12,
-    fontWeight: '700',
-    textTransform: 'uppercase',
+    fontSize: 13,
+    color: '#666',
+    marginTop: 2,
     letterSpacing: 0.5,
   },
-  scanTime: {
-    color: '#48484A',
-    marginTop: 3,
-    fontSize: 10,
-    fontWeight: '500',
-  },
-
-  // Banner
-  banner: {
-    backgroundColor: '#FF453A',
-    padding: 10,
-    alignItems: 'center',
-  },
-  bannerText: {
-    color: '#FFF',
-    fontWeight: 'bold',
-    fontSize: 13,
-  },
-
-  // Content
-  content: {
-    padding: 16,
-    flex: 1,
-  },
-
-  // Buttons
-  buttonRow: {
+  statsRow: {
     flexDirection: 'row',
-    marginBottom: 20,
+    justifyContent: 'space-between',
+    marginTop: 8,
   },
-  scanButton: {
-    backgroundColor: '#0A84FF',
-    padding: 16,
-    borderRadius: 14,
-    alignItems: 'center',
-    justifyContent: 'center',
-    shadowColor: '#0A84FF',
-    shadowOpacity: 0.4,
-    shadowRadius: 10,
-    shadowOffset: { width: 0, height: 4 },
-    elevation: 8,
-  },
-  buttonInner: {
-    flexDirection: 'row',
-    alignItems: 'center',
-  },
-  buttonText: {
-    fontWeight: '800',
-    fontSize: 15,
-    color: '#FFF',
+  stat: {
+    fontSize: 12,
+    color: '#888',
   },
 
-  // Empty State
-  emptyState: {
-    flex: 1,
-    justifyContent: 'center',
-    alignItems: 'center',
+  // ── Device List ──
+  list: {
+    padding: 12,
     paddingBottom: 100,
   },
-  emptyIcon: {
-    fontSize: 64,
-    marginBottom: 16,
-  },
-  emptyTitle: {
-    color: '#FFF',
-    fontSize: 20,
-    fontWeight: '800',
-    marginBottom: 8,
-  },
-  emptySubtitle: {
-    color: '#636366',
-    fontSize: 14,
-    textAlign: 'center',
-    paddingHorizontal: 40,
-  },
 
-  // Cards
+  // ── Device Card ──
   card: {
+    borderRadius: 12,
     padding: 14,
-    borderRadius: 16,
-    marginBottom: 12,
-    flexDirection: 'row',
+    marginBottom: 10,
     borderWidth: 1,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 4 },
-    shadowOpacity: 0.3,
-    shadowRadius: 6,
-    elevation: 4,
+  },
+  trustedCard: {
+    backgroundColor: '#0d1f12',
+    borderColor: '#1a3d20',
   },
   intruderCard: {
-    backgroundColor: 'rgba(40, 8, 8, 0.9)',
-    borderColor: 'rgba(255, 69, 58, 0.25)',
-  },
-  safeCard: {
-    backgroundColor: 'rgba(8, 40, 8, 0.9)',
-    borderColor: 'rgba(48, 209, 88, 0.25)',
-  },
-
-  // Icon column
-  iconContainer: {
-    marginRight: 12,
-    alignItems: 'center',
-    justifyContent: 'center',
-    width: 44,
-  },
-  deviceIcon: {
-    fontSize: 26,
-  },
-  typeLabel: {
-    color: '#636366',
-    fontSize: 7,
-    fontWeight: '800',
-    textTransform: 'uppercase',
-    letterSpacing: 0.5,
-    marginTop: 4,
-    textAlign: 'center',
-  },
-
-  // Card body
-  cardBody: {
-    flex: 1,
+    backgroundColor: '#1f0d0d',
+    borderColor: '#3d1a1a',
   },
   cardHeader: {
     flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    marginBottom: 4,
-  },
-  statusRow: {
-    flexDirection: 'row',
     alignItems: 'center',
   },
-  statusDot: {
-    width: 6,
-    height: 6,
-    borderRadius: 3,
-    marginRight: 5,
+  cardEmoji: {
+    fontSize: 28,
+    marginRight: 12,
   },
-  statusLabel: {
-    fontSize: 9,
-    fontWeight: '900',
-    letterSpacing: 1.2,
+  cardInfo: {
+    flex: 1,
   },
-  actionRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-  },
-  riskBadge: {
-    backgroundColor: '#FF453A',
-    paddingHorizontal: 6,
-    paddingVertical: 2,
-    borderRadius: 4,
-  },
-  riskText: {
-    color: '#FFF',
-    fontSize: 8,
-    fontWeight: '900',
-    letterSpacing: 0.5,
-  },
-  keyButton: {
-    backgroundColor: 'rgba(255,255,255,0.08)',
-    borderRadius: 10,
-    padding: 4,
-    marginLeft: 6,
-  },
-
-  // Text
-  deviceName: {
-    color: '#FFF',
-    fontSize: 15,
+  cardIP: {
+    fontSize: 16,
     fontWeight: '700',
-  },
-  deviceIp: {
-    color: '#AEAEB2',
-    fontSize: 13,
-    marginTop: 2,
-  },
-  macText: {
-    color: '#48484A',
-    fontSize: 10,
-    marginTop: 3,
+    color: '#fff',
     fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
   },
-  hintText: {
-    color: '#FF453A',
-    fontSize: 9,
-    marginTop: 5,
+  cardType: {
+    fontSize: 12,
+    color: '#aaa',
+    marginTop: 2,
+  },
+  cardActions: {
+    flexDirection: 'row',
+    gap: 8,
+  },
+  auditBtn: {
+    padding: 8,
+    borderRadius: 8,
+    backgroundColor: '#2a1a00',
+    borderWidth: 1,
+    borderColor: '#4a3000',
+  },
+  auditBtnText: {
+    fontSize: 18,
+  },
+  trustBtn: {
+    padding: 8,
+    borderRadius: 8,
+    borderWidth: 1,
+  },
+  trustedBtn: {
+    backgroundColor: '#0d2818',
+    borderColor: '#1a5030',
+  },
+  untrustedBtn: {
+    backgroundColor: '#280d0d',
+    borderColor: '#501a1a',
+  },
+  trustBtnText: {
+    fontSize: 18,
+  },
+  cardDetails: {
+    marginTop: 8,
+    paddingTop: 8,
+    borderTopWidth: 1,
+    borderTopColor: '#1a1a1a',
+  },
+  cardMAC: {
+    fontSize: 11,
+    color: '#666',
+    fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
+  },
+  cardVendor: {
+    fontSize: 11,
+    color: '#888',
+    marginTop: 2,
+  },
+  cardStatus: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginTop: 8,
+  },
+  statusBadge: {
+    fontSize: 11,
+    fontWeight: '700',
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderRadius: 6,
+    overflow: 'hidden',
+  },
+  trustedBadge: {
+    color: '#00ff88',
+    backgroundColor: '#0a2a14',
+  },
+  intruderBadge: {
+    color: '#ff4444',
+    backgroundColor: '#2a0a0a',
+  },
+  cardHint: {
+    fontSize: 10,
+    color: '#444',
     fontStyle: 'italic',
-    opacity: 0.7,
+  },
+
+  // ── Empty State ──
+  emptyState: {
+    alignItems: 'center',
+    paddingTop: 80,
+  },
+  emptyEmoji: {
+    fontSize: 48,
+    marginBottom: 12,
+  },
+  emptyText: {
+    color: '#666',
+    fontSize: 16,
+  },
+  emptyHint: {
+    color: '#444',
+    fontSize: 13,
+    marginTop: 4,
+  },
+
+  // ── Buttons ──
+  buttonRow: {
+    flexDirection: 'row',
+    padding: 16,
+    paddingBottom: Platform.OS === 'ios' ? 30 : 16,
+    gap: 10,
+    backgroundColor: '#0a0a0a',
+    borderTopWidth: 1,
+    borderTopColor: '#1a1a1a',
+  },
+  scanBtn: {
+    flex: 2,
+    backgroundColor: '#00cc66',
+    paddingVertical: 14,
+    borderRadius: 10,
+    alignItems: 'center',
+  },
+  scanBtnDisabled: {
+    backgroundColor: '#004422',
+  },
+  scanBtnText: {
+    color: '#000',
+    fontSize: 16,
+    fontWeight: '800',
+    letterSpacing: 1,
+  },
+  reportBtn: {
+    flex: 1,
+    backgroundColor: '#1a1a2e',
+    paddingVertical: 14,
+    borderRadius: 10,
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: '#2a2a4e',
+  },
+  reportBtnText: {
+    color: '#aaa',
+    fontSize: 14,
+    fontWeight: '700',
   },
 });
