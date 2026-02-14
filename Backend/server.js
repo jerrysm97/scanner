@@ -55,8 +55,8 @@ app.get('/api/audit', (req, res) => {
     if (!ip || !ipRegex.test(ip)) return res.status(400).json({ error: "Invalid IP" });
 
     console.log(`🔓 Auditing Credentials for ${ip}...`);
-    // Calls python script with 'audit' argument
-    exec(`python3 ../agent.py ${ip} audit`, (error, stdout, stderr) => {
+    // Calls python script with 'audit <IP>' arguments
+    exec(`python3 ../agent.py audit ${ip}`, (error, stdout, stderr) => {
         if (error) return res.status(500).json({ error: "Audit failed" });
         try {
             res.json(JSON.parse(stdout));

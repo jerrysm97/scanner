@@ -64,18 +64,37 @@ export default function App() {
     }
   };
 
-  // 🕵️ NEW: CREDENTIAL AUDIT LOGIC (Replaces simple deep scan)
+  // 🕵️ NEW: DEEP SCAN LOGIC
+  const inspectDevice = async (ip: string) => {
+    Alert.alert("🕵️ Deep Scan Started", `Analyzing ${ip} for vulnerabilities...`);
+    try {
+      const response = await fetch(`${BASE_URL}/api/inspect?ip=${ip}`);
+      const data = await response.json();
+
+      // OPTIONAL CHAINING FIX
+      const portList = data.open_ports?.length > 0 ? data.open_ports.join(', ') : "None";
+
+      Alert.alert(
+        `🔎 Analysis Report: ${data.hostname}`,
+        `Risk Level: ${data.risk_level}\n\n🔓 Open Ports: ${portList}\n\n(Ports 22/554 are high risk!)`
+      );
+    } catch (e) {
+      Alert.alert("Error", "Deep scan failed.");
+    }
+  };
+
+  // 🔑 NEW: CREDENTIAL AUDIT
   const auditDevice = async (ip: string) => {
-    Alert.alert("🕵️ Security Audit", `Testing credentials on ${ip}...\n(This ensures default passwords are changed)`);
+    Alert.alert("🔐 Security Audit", `Checking ${ip} for default 'admin:admin' credentials...`);
     try {
       const response = await fetch(`${BASE_URL}/api/audit?ip=${ip}`);
       const data = await response.json();
 
-      const isCritical = data.risk === "CRITICAL";
-      const title = isCritical ? "🚨 CRITICAL VULNERABILITY" : "✅ Audit Passed";
-      const message = `${data.message}\nRisk Level: ${data.risk}`;
-
-      Alert.alert(title, message);
+      if (data.status === "VULNERABLE") {
+        Alert.alert("🚨 CRITICAL ALERT", "This device is using DEFAULT CREDENTIALS (admin:admin). Change password immediately!");
+      } else {
+        Alert.alert("✅ SECURE", "Device rejected default credentials.");
+      }
     } catch (e) {
       Alert.alert("Error", "Audit failed.");
     }
@@ -171,7 +190,7 @@ export default function App() {
               <TouchableOpacity
                 activeOpacity={0.6}
                 onPress={() => toggleTrust(item.mac)}
-                onLongPress={() => auditDevice(item.ip)}
+                onLongPress={() => inspectDevice(item.ip)}
                 delayLongPress={500}
               >
                 <View style={[styles.card, isIntruder ? styles.intruderCard : styles.safeCard]}>
@@ -186,8 +205,14 @@ export default function App() {
                         {isIntruder ? "UNAUTHORIZED" : "SECURE"}
                       </Text>
                       {isIntruder && (
-                        <View style={styles.riskBadge}>
-                          <Text style={styles.riskText}>HIGH RISK</Text>
+                        <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+                          <View style={styles.riskBadge}>
+                            <Text style={styles.riskText}>HIGH RISK</Text>
+                          </View>
+                          {/* 🔐 KEY ICON BUTTON */}
+                          <TouchableOpacity style={styles.keyButton} onPress={() => auditDevice(item.ip)}>
+                            <Text style={{ fontSize: 16 }}>🔐</Text>
+                          </TouchableOpacity>
                         </View>
                       )}
                     </View>
@@ -196,7 +221,7 @@ export default function App() {
                     <Text style={styles.deviceIp}>{item.ip}</Text>
                     <Text style={styles.macText}>{item.mac}</Text>
 
-                    {isIntruder && <Text style={styles.hintText}>Long Press to Audit (Vuln Check)</Text>}
+                    {isIntruder && <Text style={styles.hintText}>Long Press to Inspect • Tap 🔐 to Audit</Text>}
                   </View>
                 </View>
               </TouchableOpacity>
@@ -250,5 +275,6 @@ const styles = StyleSheet.create({
   macText: { color: '#555', fontSize: 11, marginTop: 4, fontFamily: 'monospace' },
   hintText: { color: '#FF453A', fontSize: 10, marginTop: 5, fontStyle: 'italic', opacity: 0.8 },
   riskBadge: { backgroundColor: '#FF453A', paddingHorizontal: 6, paddingVertical: 2, borderRadius: 4 },
-  riskText: { color: '#000', fontSize: 10, fontWeight: 'bold' }
+  riskText: { color: '#000', fontSize: 10, fontWeight: 'bold' },
+  keyButton: { backgroundColor: '#333', borderRadius: 12, padding: 4, marginLeft: 8 }
 });

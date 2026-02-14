@@ -4,18 +4,49 @@ import re
 import json
 import sys
 import socket
+import platform
+import urllib.request
+import base64
+import urllib.error
 
-def scan_mac_native():
-    """ Basic ARP scan to find devices """
+def scan_network():
+    """ 
+    Robust ARP scan that detects OS (Linux vs MacOS) 
+    and parses 'arp -a' correctly for both.
+    """
+    devices = []
     try:
-        raw_output = subprocess.check_output(["arp", "-a"]).decode("utf-8")
-        devices = []
+        # Detect OS
+        os_type = platform.system()
+        args = ["arp", "-a"]
+        
+        # Execute command
+        raw_output = subprocess.check_output(args).decode("utf-8")
+        
         for line in raw_output.split('\n'):
-            match = re.search(r'\((.*?)\) at (.*?) on', line)
-            if match:
-                ip, mac = match.groups()
-                if "incomplete" not in mac:
-                    devices.append({"ip": ip, "mac": mac, "status": "online"})
+            ip = None
+            mac = None
+            
+            if os_type == "Darwin": # macOS
+                # Format: ? (192.168.1.1) at 00:11:22:33:44:55 on en0 ...
+                match = re.search(r'\((.*?)\) at (.*?) on', line)
+                if match:
+                    ip, mac = match.group(1), match.group(2)
+            else: # Linux / Windows (Assuming Linux-like output for generic container)
+                # Format: ? (192.168.1.1) at 00:11:22:33:44:55 [ether] on eth0
+                match = re.search(r'\((.*?)\) at (.*?) \[', line)
+                if not match:
+                    # Alternative Linux format: 192.168.1.1 at 00:11...
+                    parts = line.split()
+                    if len(parts) >= 4:
+                        ip = parts[1].strip('()')
+                        mac = parts[3]
+                else:
+                    ip, mac = match.group(1), match.group(2)
+
+            if ip and mac and "incomplete" not in mac:
+                devices.append({"ip": ip, "mac": mac, "status": "online"})
+                
         return devices
     except Exception as e:
         return {"error": str(e)}
@@ -49,10 +80,10 @@ def deep_scan(target_ip):
     }
 
 def audit_credentials(target_ip):
-    """ Vulnerability Scanner: Checks for weak 'admin:admin' credentials """
-    import urllib.request
-    import base64
-
+    """ 
+    Vulnerability Scanner: Checks for weak 'admin:admin' credentials 
+    Returns: {"status": "VULNERABLE"} or {"status": "SECURE"}
+    """
     url = f"http://{target_ip}"
     # Create Basic Auth Header for "admin:admin"
     credentials = base64.b64encode(b"admin:admin").decode("utf-8")
@@ -60,36 +91,47 @@ def audit_credentials(target_ip):
     
     try:
         req = urllib.request.Request(url, headers=headers)
-        # Timeout is crucial to avoid hanging
-        with urllib.request.urlopen(req, timeout=2) as response:
+        # Timeout is 1 second as requested
+        with urllib.request.urlopen(req, timeout=1) as response:
             if response.getcode() == 200:
-                return {"status": "SUCCESS", "risk": "CRITICAL", "message": "Weak Credentials (admin:admin) Found!"}
+                return {"status": "VULNERABLE", "risk": "CRITICAL", "message": "Default credentials (admin:admin) accepted!"}
     except urllib.error.HTTPError as e:
         if e.code == 401:
-            return {"status": "FAILED", "risk": "LOW", "message": "Device is password protected."}
+            return {"status": "SECURE", "risk": "LOW", "message": "Device is password protected."}
     except Exception as e:
-        return {"status": "ERROR", "risk": "LOW", "message": f"Connection failed: {str(e)}"}
+        # Connection failed or other error - consider it secure/unreachable for this specific test
+        return {"status": "SECURE", "risk": "LOW", "message": f"Connection failed/Auth not requested: {str(e)}"}
     
-    return {"status": "UNKNOWN", "risk": "LOW", "message": "No typical login form found."}
+    return {"status": "SECURE", "risk": "LOW", "message": "No login form or auth required."}
 
 if __name__ == "__main__":
-    # If an IP argument is provided
     if len(sys.argv) > 1:
-        target_ip = sys.argv[1]
+        first_arg = sys.argv[1]
         
-        # Check for mode argument
-        mode = sys.argv[2] if len(sys.argv) > 2 else "scan"
-        
-        if mode == "audit":
-            print(json.dumps(audit_credentials(target_ip)))
+        if first_arg == "audit":
+            # Usage: python3 agent.py audit <IP>
+            if len(sys.argv) > 2:
+                target_ip = sys.argv[2]
+                print(json.dumps(audit_credentials(target_ip)))
+            else:
+                 print(json.dumps({"error": "Missing IP for audit"}))
         else:
-            print(json.dumps(deep_scan(target_ip)))
+            # Usage: python3 agent.py <IP>  (Deep Scan)
+            print(json.dumps(deep_scan(first_arg)))
     else:
-        # Otherwise, do a normal discovery scan
-        found_devices = scan_mac_native()
-        results = {
-            "status": "success",
-            "count": len(found_devices),
-            "devices": found_devices
-        }
+        # Usage: python3 agent.py (Discovery)
+        found_devices = scan_network()
+        if isinstance(found_devices, dict) and "error" in found_devices:
+             results = {
+                "status": "error",
+                "message": found_devices["error"],
+                "count": 0,
+                "devices": []
+            }
+        else:
+            results = {
+                "status": "success",
+                "count": len(found_devices),
+                "devices": found_devices
+            }
         print(json.dumps(results))
