@@ -5,8 +5,10 @@ const app = express();
 
 const macLookup = require('mac-lookup');
 
-// Helper to load the vendor database
-macLookup.rebuild(); // downloads latest OUI database
+// Helper to load the vendor database - Load once at startup
+macLookup.load(() => {
+    console.log("📂 OUI Database loaded successfully.");
+});
 
 app.use(cors()); // Allow cross-origin requests
 
@@ -15,30 +17,29 @@ app.get('/api/scan', (req, res) => {
     console.log("📡 Scan requested...");
     // Run without sudo; agent.py handles permission fallback
     exec('python3 ../agent.py', async (error, stdout, stderr) => {
-        if (error) {
-            console.error(`Exec error: ${error}`);
+        if (error || stderr) {
+            console.error(`Exec error: ${error || stderr}`);
             return res.status(500).json({ error: "Failed to run scanner" });
         }
 
         try {
-            let scanResults = JSON.parse(stdout);
+            // FIX: agent.py output is already JSON string if exec returns it as stdout
+            let rawData = typeof stdout === 'string' ? JSON.parse(stdout) : stdout;
+            let devices = rawData.devices || [];
 
-            // If results are in 'devices' array
-            if (scanResults.devices) {
-                // Enrich data with Vendor Name
-                const enrichedDevices = await Promise.all(scanResults.devices.map(async (device) => {
-                    const vendor = await new Promise(resolve => {
-                        macLookup.get(device.mac, (err, name) => resolve(name || "Unknown Vendor"));
-                    });
-                    return { ...device, vendor };
-                }));
+            // Enrich data with Vendor Name
+            const enrichedDevices = await Promise.all(devices.map(async (device) => {
+                const vendor = await new Promise(resolve => {
+                    // mac-lookup uses .lookup(oui, callback)
+                    macLookup.lookup(device.mac, (err, name) => resolve(name || "Unknown Vendor"));
+                });
+                return { ...device, vendor };
+            }));
 
-                scanResults.devices = enrichedDevices;
-            }
-
-            res.json(scanResults);
+            res.json({ status: "success", count: enrichedDevices.length, devices: enrichedDevices });
         } catch (parseError) {
-            res.json({ raw_output: stdout.trim() });
+            console.error("Parse Error:", parseError, "Raw output:", stdout);
+            res.json({ error: "Invalid scanner output", raw_output: stdout.trim() });
         }
     });
 });

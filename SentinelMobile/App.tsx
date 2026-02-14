@@ -168,9 +168,16 @@ export default function App() {
 
       <View style={styles.content}>
         <View style={styles.buttonRow}>
-          <TouchableOpacity style={[styles.scanButton, { flex: 2, marginRight: 10 }]} onPress={fetchScan}>
+          <TouchableOpacity
+            style={[styles.scanButton, { flex: 2, marginRight: 10, opacity: loading ? 0.7 : 1 }]}
+            onPress={fetchScan}
+            disabled={loading}
+          >
             {loading ? (
-              <ActivityIndicator color="#000" />
+              <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+                <ActivityIndicator color="#FFF" />
+                <Text style={[styles.buttonText, { marginLeft: 10 }]}>SCANNING...</Text>
+              </View>
             ) : (
               <Text style={styles.buttonText}>🚀 SCAN NETWORK</Text>
             )}
@@ -259,18 +266,24 @@ const styles = StyleSheet.create({
   bannerText: { color: '#FFF', fontWeight: 'bold' },
   card: {
     padding: 16,
-    borderRadius: 16,
-    marginBottom: 14,
+    borderRadius: 20,
+    marginBottom: 16,
     flexDirection: 'row',
-    borderWidth: 1
+    borderWidth: 1,
+    // Glassmorphism effect
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.3,
+    shadowRadius: 8,
+    elevation: 5
   },
   intruderCard: {
-    backgroundColor: '#1A0505',
-    borderColor: '#5e1010'
+    backgroundColor: 'rgba(42, 5, 5, 0.8)',
+    borderColor: 'rgba(255, 69, 58, 0.3)'
   },
   safeCard: {
-    backgroundColor: '#051A05',
-    borderColor: '#0e3b12'
+    backgroundColor: 'rgba(5, 42, 5, 0.8)',
+    borderColor: 'rgba(52, 199, 89, 0.3)'
   },
   iconContainer: { marginRight: 15 },
   statusLabel: { fontSize: 10, fontWeight: '900', letterSpacing: 1, marginBottom: 4 },

@@ -18,14 +18,24 @@ logging.getLogger("scapy.runtime").setLevel(logging.ERROR)
 def get_local_ip_range():
     """Auto-detects local IP and subnet (e.g., 192.168.1.0/24)"""
     try:
+        # Improved detection using socket
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        # Doesn't need to connect, just needs to pick an interface
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-        s.close()
+        s.settimeout(0)
+        try:
+            # doesn't even have to be reachable
+            s.connect(('10.254.254.254', 1))
+            ip = s.getsockname()[0]
+        except Exception:
+            ip = '127.0.0.1'
+        finally:
+            s.close()
+        
+        if ip == '127.0.0.1':
+            return "192.168.1.0/24" # Default fallback
+            
         return f"{ip.rsplit('.', 1)[0]}.0/24"
-    except:
-        return "192.168.1.0/24" # Fallback
+    except Exception as e:
+        return "192.168.1.0/24" # Ultimate fallback
 
 def scan_network():
     """ 
