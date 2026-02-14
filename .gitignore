@@ -1,7 +1,27 @@
+# Dependencies
 node_modules/
+
+# Build artifacts
 android/app/build/
 ios/build/
+SentinelMobile/android/app/build/
+SentinelMobile/ios/build/
+
+# Python
 __pycache__/
+*.pyc
+
+# IDE
+.idea/
+*.iml
+
+# Environment
 .env
 .DS_Store
+
+# Logs
 *.log
+
+# APK/IPA
+*.apk
+*.ipa
