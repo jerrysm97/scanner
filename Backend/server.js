@@ -27,7 +27,6 @@ app.get('/api/inspect', (req, res) => {
     const ip = req.query.ip;
 
     // STRICT INPUT SANITIZATION
-    // Only allow valid IPv4 addresses (X.X.X.X)
     const ipRegex = /^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$/;
 
     if (!ip || !ipRegex.test(ip)) {
@@ -47,6 +46,49 @@ app.get('/api/inspect', (req, res) => {
             res.json({ error: "Invalid Python Output" });
         }
     });
+});
+
+// 3. AUDIT Endpoint (Vulnerability Scanner)
+app.get('/api/audit', (req, res) => {
+    const ip = req.query.ip;
+    const ipRegex = /^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$/;
+    if (!ip || !ipRegex.test(ip)) return res.status(400).json({ error: "Invalid IP" });
+
+    console.log(`🔓 Auditing Credentials for ${ip}...`);
+    // Calls python script with 'audit' argument
+    exec(`python3 ../agent.py ${ip} audit`, (error, stdout, stderr) => {
+        if (error) return res.status(500).json({ error: "Audit failed" });
+        try {
+            res.json(JSON.parse(stdout));
+        } catch (e) {
+            res.json({ error: "Invalid Output" });
+        }
+    });
+});
+
+// 4. ACTIVE HONEYPOT TRAP
+const net = require('net');
+const honeypotLogs = [];
+
+// Lightweight TCP Server on Port 2323 (Fake Telnet)
+const honeypot = net.createServer((socket) => {
+    const intruderIp = socket.remoteAddress?.replace('::ffff:', '');
+    const timestamp = new Date().toLocaleTimeString();
+
+    console.log(`🚨 HONEYPOT TRIGGERED by ${intruderIp} at ${timestamp}`);
+    honeypotLogs.unshift({ ip: intruderIp, time: timestamp }); // Add to start
+
+    // Don't actually let them connect, just log and close
+    socket.end();
+});
+
+honeypot.listen(2323, () => {
+    console.log("🪤 Honeypot Active on Port 2323");
+});
+
+// Endpoint to fetch honeypot logs
+app.get('/api/honeypot', (req, res) => {
+    res.json(honeypotLogs);
 });
 
 const PORT = 3000;
