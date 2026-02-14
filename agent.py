@@ -30,8 +30,8 @@ def deep_scan(target_ip):
     
     # 2. Scan Common Ports
     open_ports = []
-    # Ports: FTP, SSH, DNS, HTTP, HTTPS, RTSP(Camera), Alt-HTTP
-    common_ports = [21, 22, 53, 80, 443, 554, 8080]
+    # Ports: FTP, SSH, DNS, HTTP, HTTPS, Modbus, RTSP, Alt-HTTP
+    common_ports = [21, 22, 53, 80, 443, 502, 554, 8080]
    
     for port in common_ports:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

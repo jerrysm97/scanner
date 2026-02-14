@@ -107,8 +107,8 @@ export default function App() {
 
         <FlatList
           data={devices}
-          extraData={trustedMacs}
-          keyExtractor={(item) => item.mac}
+          keyExtractor={(item) => item.mac} // Unique Key
+          extraData={trustedMacs} // Forces re-render when trust changes
           renderItem={({ item }) => {
             const name = getDeviceName(item.mac);
             const isTrusted = trustedMacs.includes(item.mac) || name.includes("Router");
@@ -128,12 +128,21 @@ export default function App() {
                     </Text>
                   </View>
                   <View style={{ flex: 1 }}>
-                    <Text style={[styles.statusLabel, { color: isIntruder ? '#FF453A' : '#30D158' }]}>
-                      {isIntruder ? "UNAUTHORIZED" : "SECURE DEVICE"}
-                    </Text>
+                    <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
+                      <Text style={[styles.statusLabel, { color: isIntruder ? '#FF453A' : '#30D158' }]}>
+                        {isIntruder ? "UNAUTHORIZED" : "SECURE"}
+                      </Text>
+                      {isIntruder && (
+                        <View style={styles.riskBadge}>
+                          <Text style={styles.riskText}>HIGH RISK</Text>
+                        </View>
+                      )}
+                    </View>
+
                     <Text style={styles.deviceName}>{name}</Text>
                     <Text style={styles.deviceIp}>{item.ip}</Text>
                     <Text style={styles.macText}>{item.mac}</Text>
+
                     {isIntruder && <Text style={styles.hintText}>Long Press to Inspect</Text>}
                   </View>
                 </View>
@@ -185,5 +194,7 @@ const styles = StyleSheet.create({
   deviceName: { color: '#fff', fontSize: 17, fontWeight: 'bold' },
   deviceIp: { color: '#999', fontSize: 14, marginTop: 2 },
   macText: { color: '#555', fontSize: 11, marginTop: 4, fontFamily: 'monospace' },
-  hintText: { color: '#FF453A', fontSize: 10, marginTop: 5, fontStyle: 'italic', opacity: 0.8 }
+  hintText: { color: '#FF453A', fontSize: 10, marginTop: 5, fontStyle: 'italic', opacity: 0.8 },
+  riskBadge: { backgroundColor: '#FF453A', paddingHorizontal: 6, paddingVertical: 2, borderRadius: 4 },
+  riskText: { color: '#000', fontSize: 10, fontWeight: 'bold' }
 });

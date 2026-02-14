@@ -25,7 +25,14 @@ app.get('/api/scan', (req, res) => {
 // 2. NEW Deep Scan Endpoint
 app.get('/api/inspect', (req, res) => {
     const ip = req.query.ip;
-    if (!ip) return res.status(400).json({ error: "IP required" });
+
+    // STRICT INPUT SANITIZATION
+    // Only allow valid IPv4 addresses (X.X.X.X)
+    const ipRegex = /^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$/;
+
+    if (!ip || !ipRegex.test(ip)) {
+        return res.status(400).json({ error: "Invalid IP address format" });
+    }
 
     console.log(`🔎 Deep Scanning ${ip}...`);
 
