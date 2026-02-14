@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import {
   SafeAreaView,
   StyleSheet,
@@ -9,164 +9,279 @@ import {
   Platform,
   Alert,
   ActivityIndicator,
-  Share
+  Share,
+  StatusBar,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  TYPES
+// ═══════════════════════════════════════════════════════════════════════════════
 
 interface Device {
   ip: string;
   mac: string;
   status: string;
+  scan_mode?: string;
   vendor?: string;
+  deviceType?: string;
 }
 
 interface HoneypotLog {
   ip: string;
   time: string;
+  port?: number;
 }
+
+interface ScanResponse {
+  status: string;
+  scan_mode: string;
+  subnet: string;
+  count: number;
+  is_root: boolean;
+  timestamp: string;
+  devices: Device[];
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  DEVICE ICON RESOLVER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+function getDeviceIcon(deviceType?: string): string {
+  switch (deviceType) {
+    case 'mobile': return '📱';
+    case 'desktop': return '🖥️';
+    case 'iot': return '📡';
+    case 'network': return '🌐';
+    default: return '❓';
+  }
+}
+
+function getDeviceLabel(deviceType?: string): string {
+  switch (deviceType) {
+    case 'mobile': return 'MOBILE';
+    case 'desktop': return 'DESKTOP';
+    case 'iot': return 'IoT DEVICE';
+    case 'network': return 'NETWORK';
+    default: return 'UNKNOWN';
+  }
+}
+
+function getRiskColor(risk?: string): string {
+  switch (risk) {
+    case 'CRITICAL': return '#FF2D55';
+    case 'HIGH': return '#FF453A';
+    case 'MEDIUM': return '#FF9F0A';
+    case 'LOW': return '#30D158';
+    default: return '#8E8E93';
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  STORAGE KEYS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const STORAGE_KEYS = {
+  TRUSTED_MACS: '@sentinel_trusted_macs',
+  LAST_SCAN: '@sentinel_last_scan_time',
+};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  MAIN APP
+// ═══════════════════════════════════════════════════════════════════════════════
 
 export default function App() {
   const [devices, setDevices] = useState<Device[]>([]);
   const [loading, setLoading] = useState(false);
   const [trustedMacs, setTrustedMacs] = useState<string[]>([]);
   const [honeypotLogs, setHoneypotLogs] = useState<HoneypotLog[]>([]);
+  const [lastScanTime, setLastScanTime] = useState<string | null>(null);
+  const [scanMode, setScanMode] = useState<string>('—');
+  const [subnet, setSubnet] = useState<string>('—');
 
-  // Connection Logic
+  // ── Connection ──────────────────────────────────────────────────────────────
   const BASE_URL = Platform.OS === 'android'
     ? 'http://10.0.2.2:3000'
     : 'http://localhost:3000';
 
-  // Load trusted MACs on startup
+  // ── Load persisted data on startup ──────────────────────────────────────────
   useEffect(() => {
-    const loadTrusted = async () => {
+    const loadPersistedData = async () => {
       try {
-        const stored = await AsyncStorage.getItem('trusted_macs');
-        if (stored) setTrustedMacs(JSON.parse(stored));
+        const [storedMacs, storedTime] = await Promise.all([
+          AsyncStorage.getItem(STORAGE_KEYS.TRUSTED_MACS),
+          AsyncStorage.getItem(STORAGE_KEYS.LAST_SCAN),
+        ]);
+        if (storedMacs) setTrustedMacs(JSON.parse(storedMacs));
+        if (storedTime) setLastScanTime(storedTime);
       } catch (e) {
-        console.error("Failed to load trusted devices");
+        console.error('Failed to load persisted data:', e);
       }
     };
-    loadTrusted();
+    loadPersistedData();
   }, []);
 
-
-
-  const fetchScan = async () => {
+  // ── Network Scan ────────────────────────────────────────────────────────────
+  const fetchScan = useCallback(async () => {
     setLoading(true);
     try {
-      const response = await fetch(`${BASE_URL}/api/scan`);
-      const data = await response.json();
-      setDevices(data.devices || []);
+      const [scanRes, hpRes] = await Promise.all([
+        fetch(`${BASE_URL}/api/scan`),
+        fetch(`${BASE_URL}/api/honeypot`),
+      ]);
 
-      // Also fetch honeypot logs
-      const hpResponse = await fetch(`${BASE_URL}/api/honeypot`);
-      const hpData = await hpResponse.json();
-      setHoneypotLogs(hpData);
+      const scanData: ScanResponse = await scanRes.json();
+      const hpData: HoneypotLog[] = await hpRes.json();
+
+      setDevices(scanData.devices || []);
+      setHoneypotLogs(hpData || []);
+      setScanMode(scanData.scan_mode || 'unknown');
+      setSubnet(scanData.subnet || 'unknown');
+
+      // Persist last scan time
+      const timeStr = new Date().toLocaleString();
+      setLastScanTime(timeStr);
+      await AsyncStorage.setItem(STORAGE_KEYS.LAST_SCAN, timeStr);
 
     } catch (error) {
-      Alert.alert("Error", "Could not connect to Sentinel Agent.");
+      Alert.alert(
+        '🔴 Connection Error',
+        'Could not connect to Sentinel Backend.\n\nMake sure the server is running:\n  node server.js'
+      );
     } finally {
       setLoading(false);
     }
-  };
+  }, [BASE_URL]);
 
-  // 🕵️ NEW: DEEP SCAN LOGIC
-  const inspectDevice = async (ip: string) => {
-    Alert.alert("🕵️ Deep Scan Started", `Analyzing ${ip} for vulnerabilities...`);
+  // ── Deep Scan ───────────────────────────────────────────────────────────────
+  const inspectDevice = useCallback(async (ip: string) => {
+    Alert.alert('🕵️ Deep Scan', `Scanning ${ip} for open ports...`);
     try {
       const response = await fetch(`${BASE_URL}/api/inspect?ip=${ip}`);
       const data = await response.json();
 
-      // OPTIONAL CHAINING FIX
-      const portList = data.open_ports?.length > 0 ? data.open_ports.join(', ') : "None";
+      const ports = data.open_ports || [];
+      const portList = ports.length > 0
+        ? ports.map((p: any) => `${p.port}${p.banner ? ` (${p.banner.substring(0, 30)})` : ''}`).join('\n')
+        : 'None found';
 
       Alert.alert(
-        `🔎 Analysis Report: ${data.hostname}`,
-        `Risk Level: ${data.risk_level}\n\n🔓 Open Ports: ${portList}\n\n(Ports 22/554 are high risk!)`
+        `🔎 ${data.hostname || ip}`,
+        `Risk: ${data.risk_level || 'N/A'}\n` +
+        `Ports scanned: 20\n` +
+        `Open: ${data.port_count || 0}\n\n` +
+        `${portList}`
       );
     } catch (e) {
-      Alert.alert("Error", "Deep scan failed.");
+      Alert.alert('Error', 'Deep scan failed.');
     }
-  };
+  }, [BASE_URL]);
 
-  // 🔑 NEW: CREDENTIAL AUDIT
-  const auditDevice = async (ip: string) => {
-    Alert.alert("🔐 Security Audit", `Checking ${ip} for default 'admin:admin' credentials...`);
+  // ── Credential Audit ────────────────────────────────────────────────────────
+  const auditDevice = useCallback(async (ip: string) => {
     try {
       const response = await fetch(`${BASE_URL}/api/audit?ip=${ip}`);
       const data = await response.json();
 
-      if (data.status === "VULNERABLE") {
-        Alert.alert("🚨 CRITICAL ALERT", "This device is using DEFAULT CREDENTIALS (admin:admin). Change password immediately!");
+      if (data.status === 'VULNERABLE') {
+        const vulnCreds = data.details
+          ?.filter((d: any) => d.status === 'VULNERABLE')
+          .map((d: any) => `  • ${d.credential}`)
+          .join('\n') || '';
+
+        Alert.alert(
+          '🚨 CRITICAL — DEFAULT CREDENTIALS',
+          `${data.message}\n\nAccepted credentials:\n${vulnCreds}\n\nChange these immediately!`
+        );
       } else {
-        Alert.alert("✅ SECURE", "Device rejected default credentials.");
+        Alert.alert('✅ Secure', data.message || 'No default credentials found.');
       }
     } catch (e) {
-      Alert.alert("Error", "Audit failed.");
+      Alert.alert('Error', 'Credential audit failed.');
     }
-  };
+  }, [BASE_URL]);
 
-  const toggleTrust = async (mac: string) => {
-    let newTrusted;
-    if (trustedMacs.includes(mac)) {
-      newTrusted = trustedMacs.filter(id => id !== mac);
-    } else {
-      newTrusted = [...trustedMacs, mac];
-    }
+  // ── Trust Toggle ────────────────────────────────────────────────────────────
+  const toggleTrust = useCallback(async (mac: string) => {
+    const newTrusted = trustedMacs.includes(mac)
+      ? trustedMacs.filter(m => m !== mac)
+      : [...trustedMacs, mac];
 
     setTrustedMacs(newTrusted);
     try {
-      await AsyncStorage.setItem('trusted_macs', JSON.stringify(newTrusted));
+      await AsyncStorage.setItem(STORAGE_KEYS.TRUSTED_MACS, JSON.stringify(newTrusted));
     } catch (e) {
-      console.error("Failed to save trusted devices");
+      console.error('Failed to persist trusted MACs:', e);
     }
-  };
+  }, [trustedMacs]);
 
-  // 📄 REPORT GENERATION
-  const generateReport = async () => {
+  // ── Report Generation ──────────────────────────────────────────────────────
+  const generateReport = useCallback(async () => {
     const date = new Date().toLocaleString();
-    let report = `🛡️ SENTINEL SECURITY REPORT\nGenerated: ${date}\n\n`;
+    let report = `🛡️ SENTINEL SECURITY REPORT\n`;
+    report += `Generated: ${date}\n`;
+    report += `Subnet: ${subnet} | Mode: ${scanMode}\n\n`;
 
-    report += `--- DEVICE LIST (${devices.length}) ---\n`;
+    report += `═══ DEVICE LIST (${devices.length}) ═══\n`;
     devices.forEach(d => {
-      const name = d.vendor || "Unknown Device";
-      const isTrusted = trustedMacs.includes(d.mac);
-      report += `[${isTrusted ? "SAFE" : "UNAUTHORIZED"}] ${d.ip} - ${name}\n`;
+      const icon = getDeviceIcon(d.deviceType);
+      const vendor = d.vendor || 'Unknown';
+      const trusted = trustedMacs.includes(d.mac);
+      report += `${icon} [${trusted ? 'TRUSTED' : 'UNKNOWN'}] ${d.ip}\n`;
+      report += `   Vendor: ${vendor} | MAC: ${d.mac}\n\n`;
     });
 
     if (honeypotLogs.length > 0) {
-      report += `\n🚨 INTRUSION ATTEMPTS (${honeypotLogs.length}) ---\n`;
+      report += `\n🚨 INTRUSION ATTEMPTS (${honeypotLogs.length}) ═══\n`;
       honeypotLogs.forEach(log => {
-        report += `[BLOCKED] IP: ${log.ip} at ${log.time}\n`;
+        report += `[BLOCKED] ${log.ip} at ${log.time}\n`;
       });
     } else {
-      report += `\n✅ No Intrusions Detected.\n`;
+      report += `\n✅ No intrusion attempts detected.\n`;
     }
 
     try {
       await Share.share({ message: report });
-    } catch (error) {
-      Alert.alert("Error", "Could not export report.");
+    } catch {
+      Alert.alert('Error', 'Could not export report.');
     }
-  };
+  }, [devices, honeypotLogs, trustedMacs, scanMode, subnet]);
+
+  // ── Computed values ─────────────────────────────────────────────────────────
+  const untrustedCount = devices.filter(d => !trustedMacs.includes(d.mac)).length;
+
+  // ═══════════════════════════════════════════════════════════════════════════════
+  //  RENDER
+  // ═══════════════════════════════════════════════════════════════════════════════
 
   return (
     <SafeAreaView style={styles.container}>
+      <StatusBar barStyle="light-content" backgroundColor="#000" />
+
+      {/* ── Header ──────────────────────────────────────────────────────── */}
       <View style={styles.header}>
         <Text style={styles.title}>🛡️ Sentinel Pro</Text>
         <Text style={styles.subtitle}>
-          {devices.length} Devices • {honeypotLogs.length} Intrusions
+          {devices.length} Devices • {untrustedCount} Unknown • {honeypotLogs.length} Intrusions
         </Text>
+        {lastScanTime && (
+          <Text style={styles.scanTime}>Last scan: {lastScanTime} • {scanMode.toUpperCase()}</Text>
+        )}
       </View>
 
-      {/* HONEYPOT BANNER */}
+      {/* ── Honeypot Banner ─────────────────────────────────────────────── */}
       {honeypotLogs.length > 0 && (
         <View style={styles.banner}>
-          <Text style={styles.bannerText}>🚨 HONEYPOT TRIGGERED! ({honeypotLogs.length})</Text>
+          <Text style={styles.bannerText}>
+            🚨 HONEYPOT TRIGGERED! ({honeypotLogs.length} intrusion{honeypotLogs.length > 1 ? 's' : ''})
+          </Text>
         </View>
       )}
 
+      {/* ── Content ─────────────────────────────────────────────────────── */}
       <View style={styles.content}>
+
+        {/* Action Buttons */}
         <View style={styles.buttonRow}>
           <TouchableOpacity
             style={[styles.scanButton, { flex: 2, marginRight: 10, opacity: loading ? 0.7 : 1 }]}
@@ -174,7 +289,7 @@ export default function App() {
             disabled={loading}
           >
             {loading ? (
-              <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+              <View style={styles.buttonInner}>
                 <ActivityIndicator color="#FFF" />
                 <Text style={[styles.buttonText, { marginLeft: 10 }]}>SCANNING...</Text>
               </View>
@@ -183,19 +298,37 @@ export default function App() {
             )}
           </TouchableOpacity>
 
-          <TouchableOpacity style={[styles.scanButton, { flex: 1, backgroundColor: '#34C759' }]} onPress={generateReport}>
+          <TouchableOpacity
+            style={[styles.scanButton, { flex: 1, backgroundColor: '#34C759' }]}
+            onPress={generateReport}
+          >
             <Text style={styles.buttonText}>📄 REPORT</Text>
           </TouchableOpacity>
         </View>
 
+        {/* ── Empty State ──────────────────────────────────────────────── */}
+        {devices.length === 0 && !loading && (
+          <View style={styles.emptyState}>
+            <Text style={styles.emptyIcon}>📡</Text>
+            <Text style={styles.emptyTitle}>No Devices Found</Text>
+            <Text style={styles.emptySubtitle}>
+              Tap "SCAN NETWORK" to discover devices on your network.
+            </Text>
+          </View>
+        )}
+
+        {/* ── Device List ──────────────────────────────────────────────── */}
         <FlatList
           data={devices}
           keyExtractor={(item) => item.mac}
           extraData={trustedMacs}
+          showsVerticalScrollIndicator={false}
           renderItem={({ item }) => {
-            const name = item.vendor || "Unknown Device";
+            const vendor = item.vendor || 'Unknown Device';
             const isTrusted = trustedMacs.includes(item.mac);
-            const isIntruder = !isTrusted;
+            const isUnknown = !isTrusted;
+            const deviceIcon = getDeviceIcon(item.deviceType);
+            const deviceLabel = getDeviceLabel(item.deviceType);
 
             return (
               <TouchableOpacity
@@ -204,35 +337,49 @@ export default function App() {
                 onLongPress={() => inspectDevice(item.ip)}
                 delayLongPress={500}
               >
-                <View style={[styles.card, isIntruder ? styles.intruderCard : styles.safeCard]}>
+                <View style={[styles.card, isUnknown ? styles.intruderCard : styles.safeCard]}>
+
+                  {/* Device Type Icon */}
                   <View style={styles.iconContainer}>
-                    <Text style={{ fontSize: 28 }}>
-                      {isIntruder ? '🚨' : '🛡️'}
-                    </Text>
+                    <Text style={styles.deviceIcon}>{deviceIcon}</Text>
+                    <Text style={styles.typeLabel}>{deviceLabel}</Text>
                   </View>
-                  <View style={{ flex: 1 }}>
-                    <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
-                      <Text style={[styles.statusLabel, { color: isIntruder ? '#FF453A' : '#30D158' }]}>
-                        {isIntruder ? "UNAUTHORIZED" : "SECURE"}
-                      </Text>
-                      {isIntruder && (
-                        <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+
+                  {/* Device Info */}
+                  <View style={styles.cardBody}>
+                    <View style={styles.cardHeader}>
+                      <View style={styles.statusRow}>
+                        <View style={[styles.statusDot, { backgroundColor: isTrusted ? '#30D158' : '#FF453A' }]} />
+                        <Text style={[styles.statusLabel, { color: isTrusted ? '#30D158' : '#FF453A' }]}>
+                          {isTrusted ? 'TRUSTED' : 'UNKNOWN'}
+                        </Text>
+                      </View>
+
+                      {isUnknown && (
+                        <View style={styles.actionRow}>
                           <View style={styles.riskBadge}>
-                            <Text style={styles.riskText}>HIGH RISK</Text>
+                            <Text style={styles.riskText}>REVIEW</Text>
                           </View>
-                          {/* 🔐 KEY ICON BUTTON */}
-                          <TouchableOpacity style={styles.keyButton} onPress={() => auditDevice(item.ip)}>
-                            <Text style={{ fontSize: 16 }}>🔐</Text>
+                          <TouchableOpacity
+                            style={styles.keyButton}
+                            onPress={() => auditDevice(item.ip)}
+                          >
+                            <Text style={{ fontSize: 14 }}>🔐</Text>
                           </TouchableOpacity>
                         </View>
                       )}
                     </View>
 
-                    <Text style={styles.deviceName}>{name}</Text>
+                    <Text style={styles.deviceName} numberOfLines={1}>{vendor}</Text>
                     <Text style={styles.deviceIp}>{item.ip}</Text>
                     <Text style={styles.macText}>{item.mac}</Text>
 
-                    {isIntruder && <Text style={styles.hintText}>Long Press to Inspect • Tap 🔐 to Audit</Text>}
+                    {isUnknown && (
+                      <Text style={styles.hintText}>Tap to trust • Long press to inspect • 🔐 to audit</Text>
+                    )}
+                    {isTrusted && (
+                      <Text style={[styles.hintText, { color: '#30D158' }]}>Tap to untrust • Long press to inspect</Text>
+                    )}
                   </View>
                 </View>
               </TouchableOpacity>
@@ -244,54 +391,226 @@ export default function App() {
   );
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+//  STYLES
+// ═══════════════════════════════════════════════════════════════════════════════
+
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: '#000000' },
-  header: { padding: 25, paddingTop: 60, backgroundColor: '#1C1C1E', borderBottomWidth: 1, borderBottomColor: '#2C2C2E' },
-  title: { fontSize: 34, fontWeight: '900', color: '#FFFFFF', letterSpacing: 0.5 },
-  subtitle: { color: '#8E8E93', marginTop: 5, fontSize: 13, fontWeight: '600', textTransform: 'uppercase' },
-  content: { padding: 20, flex: 1 },
-  buttonRow: { flexDirection: 'row', marginBottom: 25 },
+  container: {
+    flex: 1,
+    backgroundColor: '#000000',
+  },
+
+  // Header
+  header: {
+    padding: 20,
+    paddingTop: Platform.OS === 'android' ? 50 : 60,
+    backgroundColor: '#0D0D0D',
+    borderBottomWidth: 1,
+    borderBottomColor: '#1C1C1E',
+  },
+  title: {
+    fontSize: 32,
+    fontWeight: '900',
+    color: '#FFFFFF',
+    letterSpacing: 0.5,
+  },
+  subtitle: {
+    color: '#8E8E93',
+    marginTop: 4,
+    fontSize: 12,
+    fontWeight: '700',
+    textTransform: 'uppercase',
+    letterSpacing: 0.5,
+  },
+  scanTime: {
+    color: '#48484A',
+    marginTop: 3,
+    fontSize: 10,
+    fontWeight: '500',
+  },
+
+  // Banner
+  banner: {
+    backgroundColor: '#FF453A',
+    padding: 10,
+    alignItems: 'center',
+  },
+  bannerText: {
+    color: '#FFF',
+    fontWeight: 'bold',
+    fontSize: 13,
+  },
+
+  // Content
+  content: {
+    padding: 16,
+    flex: 1,
+  },
+
+  // Buttons
+  buttonRow: {
+    flexDirection: 'row',
+    marginBottom: 20,
+  },
   scanButton: {
     backgroundColor: '#0A84FF',
-    padding: 18,
+    padding: 16,
     borderRadius: 14,
     alignItems: 'center',
+    justifyContent: 'center',
     shadowColor: '#0A84FF',
     shadowOpacity: 0.4,
     shadowRadius: 10,
-    elevation: 8
+    shadowOffset: { width: 0, height: 4 },
+    elevation: 8,
   },
-  buttonText: { fontWeight: '800', fontSize: 16, color: '#FFF' },
-  banner: { backgroundColor: '#FF453A', padding: 10, alignItems: 'center' },
-  bannerText: { color: '#FFF', fontWeight: 'bold' },
-  card: {
-    padding: 16,
-    borderRadius: 20,
+  buttonInner: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  buttonText: {
+    fontWeight: '800',
+    fontSize: 15,
+    color: '#FFF',
+  },
+
+  // Empty State
+  emptyState: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+    paddingBottom: 100,
+  },
+  emptyIcon: {
+    fontSize: 64,
     marginBottom: 16,
+  },
+  emptyTitle: {
+    color: '#FFF',
+    fontSize: 20,
+    fontWeight: '800',
+    marginBottom: 8,
+  },
+  emptySubtitle: {
+    color: '#636366',
+    fontSize: 14,
+    textAlign: 'center',
+    paddingHorizontal: 40,
+  },
+
+  // Cards
+  card: {
+    padding: 14,
+    borderRadius: 16,
+    marginBottom: 12,
     flexDirection: 'row',
     borderWidth: 1,
-    // Glassmorphism effect
     shadowColor: '#000',
     shadowOffset: { width: 0, height: 4 },
     shadowOpacity: 0.3,
-    shadowRadius: 8,
-    elevation: 5
+    shadowRadius: 6,
+    elevation: 4,
   },
   intruderCard: {
-    backgroundColor: 'rgba(42, 5, 5, 0.8)',
-    borderColor: 'rgba(255, 69, 58, 0.3)'
+    backgroundColor: 'rgba(40, 8, 8, 0.9)',
+    borderColor: 'rgba(255, 69, 58, 0.25)',
   },
   safeCard: {
-    backgroundColor: 'rgba(5, 42, 5, 0.8)',
-    borderColor: 'rgba(52, 199, 89, 0.3)'
+    backgroundColor: 'rgba(8, 40, 8, 0.9)',
+    borderColor: 'rgba(48, 209, 88, 0.25)',
   },
-  iconContainer: { marginRight: 15 },
-  statusLabel: { fontSize: 10, fontWeight: '900', letterSpacing: 1, marginBottom: 4 },
-  deviceName: { color: '#fff', fontSize: 17, fontWeight: 'bold' },
-  deviceIp: { color: '#999', fontSize: 14, marginTop: 2 },
-  macText: { color: '#555', fontSize: 11, marginTop: 4, fontFamily: 'monospace' },
-  hintText: { color: '#FF453A', fontSize: 10, marginTop: 5, fontStyle: 'italic', opacity: 0.8 },
-  riskBadge: { backgroundColor: '#FF453A', paddingHorizontal: 6, paddingVertical: 2, borderRadius: 4 },
-  riskText: { color: '#000', fontSize: 10, fontWeight: 'bold' },
-  keyButton: { backgroundColor: '#333', borderRadius: 12, padding: 4, marginLeft: 8 }
+
+  // Icon column
+  iconContainer: {
+    marginRight: 12,
+    alignItems: 'center',
+    justifyContent: 'center',
+    width: 44,
+  },
+  deviceIcon: {
+    fontSize: 26,
+  },
+  typeLabel: {
+    color: '#636366',
+    fontSize: 7,
+    fontWeight: '800',
+    textTransform: 'uppercase',
+    letterSpacing: 0.5,
+    marginTop: 4,
+    textAlign: 'center',
+  },
+
+  // Card body
+  cardBody: {
+    flex: 1,
+  },
+  cardHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 4,
+  },
+  statusRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  statusDot: {
+    width: 6,
+    height: 6,
+    borderRadius: 3,
+    marginRight: 5,
+  },
+  statusLabel: {
+    fontSize: 9,
+    fontWeight: '900',
+    letterSpacing: 1.2,
+  },
+  actionRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  riskBadge: {
+    backgroundColor: '#FF453A',
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    borderRadius: 4,
+  },
+  riskText: {
+    color: '#FFF',
+    fontSize: 8,
+    fontWeight: '900',
+    letterSpacing: 0.5,
+  },
+  keyButton: {
+    backgroundColor: 'rgba(255,255,255,0.08)',
+    borderRadius: 10,
+    padding: 4,
+    marginLeft: 6,
+  },
+
+  // Text
+  deviceName: {
+    color: '#FFF',
+    fontSize: 15,
+    fontWeight: '700',
+  },
+  deviceIp: {
+    color: '#AEAEB2',
+    fontSize: 13,
+    marginTop: 2,
+  },
+  macText: {
+    color: '#48484A',
+    fontSize: 10,
+    marginTop: 3,
+    fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
+  },
+  hintText: {
+    color: '#FF453A',
+    fontSize: 9,
+    marginTop: 5,
+    fontStyle: 'italic',
+    opacity: 0.7,
+  },
 });
