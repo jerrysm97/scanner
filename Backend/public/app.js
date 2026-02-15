@@ -1,399 +1,649 @@
 // ═══════════════════════════════════════════════════════════════════════════════
-//  SENTINEL — Network Command Center — Frontend Logic
+//  SENTINEL CLIENT — v3.0
 // ═══════════════════════════════════════════════════════════════════════════════
 
-// ── State ──────────────────────────────────────
-let devices = [];
-let selectedDevice = null;
-let selectedIdx = -1;
-let isMonitoring = false;
-let isBlocking = false;
-let statsInterval = null;
-let trafficInterval = null;
+let scanInterval = null;
+let currentDevices = [];
+let monitorInterval = null;
 
-// ── Toast ──────────────────────────────────────
-function toast(msg, type) {
-    const t = document.getElementById('toast');
-    t.textContent = msg;
-    t.className = 'toast show ' + (type || '');
-    setTimeout(() => t.className = 'toast', 3500);
-}
+// ── INIT ──────────────────────────────────────────────────────────────────────
+document.addEventListener('DOMContentLoaded', () => {
+    log('System initialized. Ready.');
+    updateStats();
+    scanNetwork(); // Auto-scan on load
 
-// ── Terminal Log ───────────────────────────────
-function log(msg, level) {
-    const term = document.getElementById('terminal');
-    if (!term) return;
-    const cls = level === 'err' ? 'line-err' : level === 'warn' ? 'line-warn' : 'line-info';
-    const time = new Date().toLocaleTimeString();
-    term.innerHTML += `<div class="${cls}">[${time}] ${msg}</div>`;
-    term.scrollTop = term.scrollHeight;
-}
+    // Auto-refresh stats every 5s
+    setInterval(updateStats, 5000);
+});
 
-function clearTerminal() {
-    const term = document.getElementById('terminal');
-    if (term) term.innerHTML = '<div class="line-info">[SENTINEL] Log cleared.</div>';
-}
+// ── NAVIGATION ────────────────────────────────────────────────────────────────
+function switchTab(tabId) {
+    // Hide all sections
+    document.querySelectorAll('.view-section').forEach(el => el.style.display = 'none');
+    document.querySelectorAll('.view-section').forEach(el => el.classList.remove('active'));
 
-function toggleTerminal() {
-    const s = document.getElementById('terminalSection');
-    s.style.display = s.style.display === 'none' ? 'block' : 'none';
-}
+    // Show selected section
+    const target = document.getElementById(`view-${tabId}`);
+    if (target) {
+        target.style.display = 'block';
+        setTimeout(() => target.classList.add('active'), 10);
+    }
 
-// ── Server Status ──────────────────────────────
-async function checkStatus() {
-    try {
-        const res = await fetch('/api/status');
-        if (res.ok) {
-            const pill = document.getElementById('statusPill');
-            const dot = document.getElementById('statusDot');
-            const txt = document.getElementById('statusText');
-            pill.className = 'status-pill online';
-            dot.className = 'status-dot on';
-            txt.textContent = 'Online — Root Active';
-            log('Server connected. Root privileges confirmed.', 'info');
-            // Auto-scan on first successful connection
-            if (devices.length === 0) {
-                log('Auto-scanning network...', 'info');
-                scanNetwork();
-            }
-        } else throw new Error('Not OK');
-    } catch {
-        const pill = document.getElementById('statusPill');
-        const dot = document.getElementById('statusDot');
-        const txt = document.getElementById('statusText');
-        pill.className = 'status-pill offline';
-        dot.className = 'status-dot off';
-        txt.textContent = 'Offline';
+    // Update Sidebar Active State
+    document.querySelectorAll('.nav-item').forEach(el => el.classList.remove('active'));
+
+    const navItem = document.getElementById(`nav-${tabId}`);
+    if (navItem) navItem.classList.add('active');
+
+    // If switching to targets, refresh the target list
+    if (tabId === 'targets') {
+        renderTargets();
     }
 }
 
-// ── Traffic Stats ──────────────────────────────
-async function updateTraffic() {
-    try {
-        const res = await fetch('/api/traffic');
-        const d = await res.json();
-        document.getElementById('downloadStat').textContent = (d.download_mb || '0') + ' MB';
-        document.getElementById('uploadStat').textContent = (d.upload_mb || '0') + ' MB';
-        document.getElementById('connStat').textContent = d.connections || '0';
-    } catch { }
-}
+// ── API CALLS ─────────────────────────────────────────────────────────────────
 
-// ── Scan Network ───────────────────────────────
 async function scanNetwork() {
-    const btn = document.getElementById('scanBtn');
-    btn.disabled = true;
-    btn.textContent = '⏳ SCANNING...';
-    document.getElementById('deviceGrid').innerHTML = `
-        <div class="loading">
-            <div class="spinner"></div>
-            <div>Performing active sweep + ARP discovery...</div>
-            <div style="font-size:11px;color:var(--text-dim);margin-top:6px">This may take up to 30 seconds</div>
-        </div>`;
+    const statusEl = document.getElementById('scanStatus');
+    const gridEl = document.getElementById('deviceGrid');
 
-    log('Initiating network scan (ping sweep + ARP)...', 'info');
+    if (statusEl) statusEl.innerText = 'SCANNING...';
+    if (statusEl) statusEl.className = 'badge warning';
+
+    log('Initiating active network scan...');
 
     try {
-        const res = await fetch('/api/scan');
-        const data = await res.json();
+        const response = await fetch('/api/scan');
+        const data = await response.json();
 
-        if (data.status === 'error') {
-            throw new Error(data.message || 'Scan failed');
+        if (data.status === 'success') {
+            currentDevices = data.devices;
+            renderDevices(data.devices);
+            renderTargets(); // Also update targets list
+            renderRadar(data.devices); // Update Radar
+
+            document.getElementById('deviceCount').innerText = data.count;
+            document.getElementById('subnetInfo').innerText = data.subnet;
+
+            if (statusEl) statusEl.innerText = 'IDLE';
+            if (statusEl) statusEl.className = 'badge';
+            log(`Scan complete. ${data.count} devices found.`);
+        } else {
+            throw new Error(data.message || 'Unknown error');
         }
-
-        devices = data.devices || [];
-        document.getElementById('deviceCount').textContent = devices.length;
-        document.getElementById('subnetStat').textContent = data.subnet || '—';
-        document.getElementById('scanMode').textContent = `Mode: ${data.scan_mode || 'passive'} | ${devices.length} devices`;
-
-        renderDevices();
-        toast(`Found ${devices.length} devices on network`, 'success');
-        log(`Scan complete: ${devices.length} device(s) discovered.`, 'info');
-
-        if (data.database) {
-            log(`Database: ${data.database.saved} saved, ${data.database.total_logged} total logged.`, 'info');
-        }
-    } catch (e) {
-        toast('Scan failed: ' + e.message, 'error');
-        log('ERROR: Scan failed — ' + e.message, 'err');
-        document.getElementById('deviceGrid').innerHTML = `
-            <div class="empty-state">
-                <div class="empty-icon">❌</div>
-                <h3>Scan failed</h3>
-                <p>${e.message}. Make sure the server is running with sudo.</p>
-            </div>`;
-    } finally {
-        btn.disabled = false;
-        btn.textContent = '⚡ Scan Network';
+    } catch (error) {
+        console.error('Scan Error:', error);
+        log(`Scan failed: ${error.message}`);
+        if (statusEl) statusEl.innerText = 'ERROR';
+        if (statusEl) statusEl.className = 'badge danger';
     }
 }
 
-// ── Device Icons ───────────────────────────────
-function getDeviceIcon(d) {
-    const name = ((d.hostname || '') + ' ' + (d.vendor || '') + ' ' + (d.type || '')).toLowerCase();
-    if (/apple|iphone|ipad|macbook|imac/.test(name)) return '🍎';
-    if (/android|samsung|galaxy|xiaomi|oppo|vivo|huawei|mobile/.test(name)) return '📱';
-    if (/google|pixel|nest|chromecast/.test(name)) return '🔵';
-    if (/router|gateway|netgear|tp-link|linksys|cisco|networking/.test(name)) return '📡';
-    if (/amazon|alexa|echo|ring/.test(name)) return '🔶';
-    if (/printer|canon|epson|brother/.test(name)) return '🖨️';
-    if (/camera|hikvision|dahua|wyze|arlo/.test(name)) return '📹';
-    if (/tv|roku|fire|media|sonos|nvidia/.test(name)) return '📺';
-    if (/pc|laptop|dell|lenovo|hp|intel|windows/.test(name)) return '💻';
-    if (/gaming|playstation|xbox|nintendo/.test(name)) return '🎮';
-    if (/raspberry|pi|arduino|dev board/.test(name)) return '🔧';
-    if (/tesla/.test(name)) return '🚗';
-    if (/iot|espressif|tuya|shelly|smart/.test(name)) return '💡';
-    if (/privacy|random/.test(name)) return '🔒';
-    return '🖥️';
+async function updateStats() {
+    try {
+        const response = await fetch('/api/traffic');
+        const stats = await response.json();
+
+        if (stats.error) return;
+
+        document.getElementById('uploadStats').innerText = stats.upload_mb + ' MB';
+        document.getElementById('downloadStats').innerText = stats.download_mb + ' MB';
+        document.getElementById('connectionCount').innerText = stats.connections;
+    } catch (e) {
+        console.error('Stats error:', e);
+    }
 }
 
-// ── Render Devices ─────────────────────────────
-function renderDevices() {
+// ── RENDERING ─────────────────────────────────────────────────────────────────
+
+function renderDevices(devices) {
     const grid = document.getElementById('deviceGrid');
-    if (!devices.length) {
-        grid.innerHTML = `
-            <div class="empty-state">
-                <div class="empty-icon">📡</div>
-                <h3>No devices found</h3>
-                <p>Try scanning again. Make sure the server is running with <strong>sudo</strong>.</p>
-            </div>`;
+    grid.innerHTML = '';
+
+    if (devices.length === 0) {
+        grid.innerHTML = '<div class="empty-state">No devices found. Try rescanning.</div>';
         return;
     }
 
-    grid.innerHTML = devices.map((d, i) => {
-        const isRandom = (d.type || '').toLowerCase().includes('random');
-        return `
-        <div class="device-card ${d._blocked ? 'blocked' : ''} ${d._monitoring ? 'monitoring' : ''}" onclick="openDevice(${i})">
-            <div class="device-header">
-                <div class="device-info">
-                    <div class="device-icon">${getDeviceIcon(d)}</div>
-                    <div>
-                        <div class="device-name">${d.hostname && d.hostname !== 'Unknown' ? d.hostname : (d.vendor && d.vendor !== 'Unknown' ? d.vendor : 'Unknown Device')}</div>
-                        <div class="device-type">${d.type || 'Unknown'}</div>
-                    </div>
-                </div>
-                <span class="device-ip">${d.ip}</span>
+    devices.forEach(device => {
+        const card = createDeviceCard(device);
+        grid.appendChild(card);
+    });
+}
+
+// ── RADAR VISUALIZATION ──────────────────────────────────────────────────────
+function renderRadar(devices) {
+    const canvas = document.getElementById('radarCanvas');
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    const width = canvas.parentElement.offsetWidth;
+    const height = canvas.parentElement.offsetHeight;
+
+    // Set canvas resolution
+    canvas.width = width;
+    canvas.height = height;
+
+    const cx = width / 2;
+    const cy = height / 2;
+    const maxRadius = Math.min(width, height) / 2 - 20;
+
+    // Clear
+    ctx.clearRect(0, 0, width, height);
+
+    // Draw Grid Concentric Circles
+    ctx.strokeStyle = 'rgba(0, 212, 255, 0.2)';
+    ctx.lineWidth = 1;
+    [0.3, 0.6, 0.9].forEach(scale => {
+        ctx.beginPath();
+        ctx.arc(cx, cy, maxRadius * scale, 0, Math.PI * 2);
+        ctx.stroke();
+    });
+
+    // Draw Crosshairs
+    ctx.beginPath();
+    ctx.moveTo(cx, cy - maxRadius);
+    ctx.lineTo(cx, cy + maxRadius);
+    ctx.moveTo(cx - maxRadius, cy);
+    ctx.lineTo(cx + maxRadius, cy);
+    ctx.stroke();
+
+    // Draw Sweep (Animated by separate loop, or static for now)
+    // For now, let's just plot devices
+
+    devices.forEach((device, index) => {
+        // Signal Quality 0-100. Stronger = Closer to center.
+        // Default to 50 if missing (middle ring)
+        const signal = device.signal_quality || 50;
+
+        // Invert: 100% signal -> 0 distance (center)
+        // 0% signal -> maxRadius distance
+        const distance = maxRadius * (1 - (signal / 110));
+
+        // Random angle (seeded by IP for stability would be better, but random is okay for scan refresh)
+        // Let's rely on index to spread them out somewhat evenly if stable
+        const angle = (index / devices.length) * Math.PI * 2 + (Date.now() / 10000); // Verify rotation? No, keep stable.
+
+        // Use hash of IP for stable angle
+        const ipSum = device.ip.split('.').reduce((a, b) => a + parseInt(b), 0);
+        const stableAngle = (ipSum % 360) * (Math.PI / 180);
+
+        const x = cx + Math.cos(stableAngle) * distance;
+        const y = cy + Math.sin(stableAngle) * distance;
+
+        // Draw Blip
+        ctx.beginPath();
+        ctx.arc(x, y, 4, 0, Math.PI * 2);
+        ctx.fillStyle = signal > 70 ? '#00d4ff' : (signal > 40 ? '#ffd700' : '#ff4444');
+        ctx.fill();
+
+        // Glow
+        ctx.shadowBlur = 10;
+        ctx.shadowColor = ctx.fillStyle;
+
+        // Label (IP)
+        ctx.shadowBlur = 0;
+        ctx.fillStyle = 'rgba(255, 255, 255, 0.7)';
+        ctx.font = '10px monospace';
+        ctx.fillText(device.ip.split('.').pop(), x + 8, y + 3);
+    });
+}
+
+function renderTargets() {
+    const grid = document.getElementById('targetGrid');
+    grid.innerHTML = '';
+
+    // Filter devices that have a custom name
+    const targets = currentDevices.filter(d => d.name);
+
+    if (targets.length === 0) {
+        grid.innerHTML = '<div class="empty-state">No named targets yet. Rename a device to pin it here.</div>';
+        return;
+    }
+
+    targets.forEach(device => {
+        const card = createDeviceCard(device);
+        grid.appendChild(card);
+    });
+}
+
+function createDeviceCard(device) {
+    const card = document.createElement('div');
+    card.className = 'device-card';
+    card.onclick = () => openDeviceModal(device);
+
+    const isRandom = device.type === 'Privacy-Randomized MAC';
+    const icon = getIconForType(device.type);
+
+    // Display Name: Custom Name (if set) > Hostname > Vendor > "Unknown"
+    const displayName = device.name || device.hostname || device.vendor || 'Unknown Device';
+    const subText = device.name ? (device.hostname || device.vendor) : (device.vendor || device.type);
+
+    card.innerHTML = `
+        <div class="ip-badge">${device.ip}</div>
+        <div class="header">
+            <div class="device-icon">${icon}</div>
+            <div class="device-details">
+                <h3>${displayName}</h3>
+                <p>${subText}</p>
+                <p style="font-family: monospace; opacity: 0.7;">${device.mac}</p>
             </div>
-            <div class="device-meta">
-                <span class="device-mac">${d.mac}</span>
-                <span class="badge badge-online">ONLINE</span>
-                ${d._blocked ? '<span class="badge badge-blocked">⛔ BLOCKED</span>' : ''}
-                ${d._monitoring ? '<span class="badge badge-monitoring">📡 MONITORING</span>' : ''}
-                ${isRandom ? '<span class="badge badge-random">🔒 RANDOM MAC</span>' : ''}
-            </div>
-        </div>`;
-    }).join('');
+        </div>
+        <div class="meta-tags">
+            <span class="tag online">ONLINE</span>
+            ${isRandom ? '<span class="tag random">RANDOM MAC</span>' : ''}
+            <span class="tag apple">${device.vendor || 'Unknown'}</span>
+        </div>
+    `;
+    return card;
 }
 
-// ── Open Device Panel ──────────────────────────
-function openDevice(idx) {
-    selectedDevice = devices[idx];
-    selectedIdx = idx;
-
-    document.getElementById('panelName').textContent = selectedDevice.hostname && selectedDevice.hostname !== 'Unknown' ? selectedDevice.hostname : (selectedDevice.vendor || 'Unknown Device');
-    document.getElementById('panelType').textContent = selectedDevice.type || 'Unknown Device';
-    document.getElementById('panelIP').textContent = selectedDevice.ip;
-    document.getElementById('panelMAC').textContent = selectedDevice.mac;
-    document.getElementById('panelVendor').textContent = selectedDevice.vendor || 'Unknown';
-    document.getElementById('panelHost').textContent = selectedDevice.hostname || 'Unknown';
-    document.getElementById('panelClass').textContent = selectedDevice.type || 'Unknown Device';
-
-    isMonitoring = !!selectedDevice._monitoring;
-    isBlocking = !!selectedDevice._blocked;
-    updateMonitorUI();
-    updateBlockUI();
-
-    // Reset port scan
-    document.getElementById('portList').className = 'port-list';
-    document.getElementById('portList').innerHTML = '';
-
-    document.getElementById('overlay').classList.add('active');
-    document.getElementById('detailPanel').classList.add('active');
-
-    log(`Opened device panel: ${selectedDevice.ip} (${selectedDevice.vendor || 'Unknown'})`, 'info');
+function getIconForType(type) {
+    if (type.includes('Apple')) return '';
+    if (type.includes('Android') || type.includes('Mobile')) return '📱';
+    if (type.includes('PC') || type.includes('Laptop')) return '💻';
+    if (type.includes('IoT') || type.includes('Amazon')) return '🏠';
+    if (type.includes('Router') || type.includes('Network')) return '🌐';
+    if (type.includes('Game') || type.includes('Console')) return '🎮';
+    if (type.includes('Camera')) return '📷';
+    if (type.includes('Printer')) return '🖨️';
+    return '🔌';
 }
 
-function closePanel() {
-    document.getElementById('overlay').classList.remove('active');
-    document.getElementById('detailPanel').classList.remove('active');
-    if (statsInterval) { clearInterval(statsInterval); statsInterval = null; }
+// ── MODAL & ACTIONS ───────────────────────────────────────────────────────────
+
+let selectedDevice = null;
+
+function openDeviceModal(device) {
+    selectedDevice = device;
+    document.getElementById('modalTitle').innerText = device.name || device.hostname || device.vendor || 'Unknown Device';
+    document.getElementById('modalIp').innerText = device.ip;
+    document.getElementById('modalMac').innerText = device.mac;
+    document.getElementById('modalVendor').innerText = device.vendor;
+
+    // Set verify rename input value
+    document.getElementById('renameInput').value = device.name || '';
+
+    document.getElementById('modalConsole').innerText = `Target selected: ${device.ip}\nWaiting for command...`;
+
+    const modal = document.getElementById('deviceModal');
+    modal.style.display = 'flex';
 }
 
-// ── Monitor ────────────────────────────────────
-async function toggleMonitor() {
-    if (!selectedDevice) return;
-    if (isBlocking) { toast('Stop blocking first', 'error'); return; }
-
-    const btn = document.getElementById('monitorBtn');
-    btn.disabled = true;
-
-    try {
-        if (isMonitoring) {
-            await fetch('/api/mitm/stop', { method: 'POST' });
-            isMonitoring = false;
-            selectedDevice._monitoring = false;
-            if (statsInterval) { clearInterval(statsInterval); statsInterval = null; }
-            toast('Monitoring stopped', 'success');
-            log(`Stopped monitoring ${selectedDevice.ip}`, 'warn');
-        } else {
-            const res = await fetch('/api/mitm/start', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ ip: selectedDevice.ip })
-            });
-            const data = await res.json();
-            if (data.error) throw new Error(data.error);
-            isMonitoring = true;
-            selectedDevice._monitoring = true;
-            toast('ARP Spoofing + Traffic Monitor active', 'success');
-            log(`Started ARP monitoring on ${selectedDevice.ip}`, 'info');
-            statsInterval = setInterval(pollMitmStats, 2000);
-        }
-    } catch (e) {
-        toast('Monitor error: ' + e.message, 'error');
-        log('Monitor ERROR: ' + e.message, 'err');
-    }
-
-    updateMonitorUI();
-    renderDevices();
-    btn.disabled = false;
+function closeModal() {
+    document.getElementById('deviceModal').style.display = 'none';
+    selectedDevice = null;
 }
 
-async function pollMitmStats() {
-    try {
-        const res = await fetch('/api/mitm/stats');
-        const d = await res.json();
-        if (!d.error) {
-            document.getElementById('mitmDown').textContent = ((d.download_bytes || 0) / 1024 / 1024).toFixed(2) + ' MB';
-            document.getElementById('mitmUp').textContent = ((d.upload_bytes || 0) / 1024 / 1024).toFixed(2) + ' MB';
-
-            const list = document.getElementById('sitesList');
-            if (d.recent_sites && d.recent_sites.length) {
-                list.innerHTML = d.recent_sites.map(s => `
-                    <div class="site-row">
-                        <span class="site-time">${new Date(s.timestamp * 1000).toLocaleTimeString()}</span>
-                        <span class="site-domain">${s.domain}</span>
-                    </div>
-                `).join('');
-            }
-        }
-    } catch { }
-}
-
-function updateMonitorUI() {
-    const btn = document.getElementById('monitorBtn');
-    const stats = document.getElementById('monitorStats');
-    if (isMonitoring) {
-        btn.innerHTML = '⏹ Stop Monitoring';
-        btn.classList.add('active');
-        stats.classList.add('active');
-    } else {
-        btn.innerHTML = '▶ Start Monitoring';
-        btn.classList.remove('active');
-        stats.classList.remove('active');
+// Close modal when clicking outside
+window.onclick = function (event) {
+    const modal = document.getElementById('deviceModal');
+    if (event.target === modal) {
+        closeModal();
     }
 }
 
-// ── Block ──────────────────────────────────────
-async function toggleBlock() {
-    if (!selectedDevice) return;
-    if (isMonitoring) { toast('Stop monitoring first', 'error'); return; }
+// ── ACTION LOGIC ──────────────────────────────────────────────────────────────
 
-    const btn = document.getElementById('blockBtn');
-    btn.disabled = true;
-
-    try {
-        if (isBlocking) {
-            await fetch('/api/block/stop', { method: 'POST' });
-            isBlocking = false;
-            selectedDevice._blocked = false;
-            toast('Device unblocked', 'success');
-            log(`Unblocked ${selectedDevice.ip}`, 'warn');
-        } else {
-            const res = await fetch('/api/block/start', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ ip: selectedDevice.ip })
-            });
-            const data = await res.json();
-            if (data.error) throw new Error(data.error);
-            isBlocking = true;
-            selectedDevice._blocked = true;
-            toast('⛔ Device internet BLOCKED', 'success');
-            log(`BLOCKED internet for ${selectedDevice.ip}`, 'err');
-        }
-    } catch (e) {
-        toast('Block error: ' + e.message, 'error');
-        log('Block ERROR: ' + e.message, 'err');
-    }
-
-    updateBlockUI();
-    renderDevices();
-    btn.disabled = false;
-}
-
-function updateBlockUI() {
-    const btn = document.getElementById('blockBtn');
-    if (isBlocking) {
-        btn.innerHTML = '🔓 Unblock Device';
-        btn.classList.add('active');
-    } else {
-        btn.innerHTML = '🚫 Block Internet Access';
-        btn.classList.remove('active');
-    }
-}
-
-// ── Deep Port Scan ─────────────────────────────
-async function deepScan() {
+async function saveDeviceName() {
     if (!selectedDevice) return;
 
-    const btn = document.getElementById('inspectBtn');
-    const list = document.getElementById('portList');
-    btn.disabled = true;
-    btn.textContent = '⏳ Scanning Ports...';
-    list.className = 'port-list active';
-    list.innerHTML = '<div style="padding:12px;color:var(--text-dim);font-size:12px;text-align:center">Scanning 20 critical ports...</div>';
+    const name = document.getElementById('renameInput').value.trim();
+    if (!name) return alert('Please enter a name');
 
-    log(`Deep scanning ${selectedDevice.ip}...`, 'info');
+    log(`Renaming ${selectedDevice.mac} to "${name}"...`);
 
     try {
-        const res = await fetch(`/api/inspect?ip=${selectedDevice.ip}`);
+        const res = await fetch('/api/device/rename', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ mac: selectedDevice.mac, name })
+        });
         const data = await res.json();
 
-        if (data.error) throw new Error(data.error);
-
-        if (data.open_ports && data.open_ports.length > 0) {
-            list.innerHTML = `
-                <div style="margin-bottom:8px;display:flex;justify-content:space-between;align-items:center">
-                    <span style="font-family:var(--font-mono);font-size:11px;color:var(--text-dim)">${data.open_ports.length} open port(s)</span>
-                    <span class="risk-badge risk-${data.risk_level}">${data.risk_level}</span>
-                </div>
-                ${data.open_ports.map(p => `
-                    <div class="port-entry">
-                        <span class="port-num">:${p.port}</span>
-                        <span class="port-banner">${p.banner || 'No banner'}</span>
-                    </div>
-                `).join('')}
-            `;
-            log(`Port scan: ${data.open_ports.length} port(s) open, risk: ${data.risk_level}`, data.risk_level === 'CRITICAL' ? 'err' : 'warn');
+        if (data.status === 'success') {
+            log(`Success: Device renamed to ${name}`);
+            closeModal();
+            scanNetwork(); // Refresh to update list
         } else {
-            list.innerHTML = '<div style="padding:12px;color:var(--success);font-size:12px;text-align:center">✅ No open ports found (stealth mode)</div>';
-            log(`Port scan: No open ports on ${selectedDevice.ip}`, 'info');
+            alert('Failed: ' + data.error);
         }
-
-        toast(`Scan complete: ${(data.open_ports || []).length} ports found`, 'success');
     } catch (e) {
-        list.innerHTML = `<div style="padding:12px;color:var(--danger);font-size:12px;text-align:center">❌ ${e.message}</div>`;
-        toast('Port scan failed: ' + e.message, 'error');
-        log('Port scan ERROR: ' + e.message, 'err');
+        console.error(e);
+        log('Error renaming device.');
     }
-
-    btn.disabled = false;
-    btn.textContent = '🔍 Deep Port Scan';
 }
 
-// ── Init ───────────────────────────────────────
-checkStatus();
-updateTraffic();
-trafficInterval = setInterval(updateTraffic, 15000);
-setInterval(checkStatus, 30000);
+let inspectorInterval = null;
+
+async function startMitm() {
+    if (!selectedDevice) return;
+    const ip = selectedDevice.ip;
+    log(`Starting MITM on ${ip}...`);
+    appendToConsole(`> INITIATING ARP SPOOFING ON ${ip}...`);
+
+    try {
+        const res = await fetch('/api/mitm/start', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ ip, duration: 60 })
+        });
+        const data = await res.json();
+        if (data.error) {
+            appendToConsole(`ERROR: ${data.error}`);
+        } else {
+            appendToConsole(`SUCCESS: Traffic interception active.\nGateway: ${data.gateway}`);
+            log(`MITM active. Switching to Inspector...`);
+
+            // Auto-switch to Targets tab and show Inspector
+            switchTab('targets');
+            showInspector(selectedDevice);
+            closeModal();
+        }
+    } catch (e) {
+        appendToConsole(`Connection Error: ${e.message}`);
+    }
+}
+
+function showInspector(device) {
+    const panel = document.getElementById('inspectorPanel');
+    panel.style.display = 'block';
+    document.getElementById('inspectorName').innerText = device.name || device.hostname || device.vendor;
+    document.getElementById('inspectorIp').innerText = device.ip;
+
+    // Start Polling
+    if (inspectorInterval) clearInterval(inspectorInterval);
+    inspectorInterval = setInterval(updateInspector, 2000);
+}
+
+async function updateInspector() {
+    try {
+        const res = await fetch('/api/mitm/details');
+        const data = await res.json();
+
+        if (data.error) return; // No active monitor
+
+        // Update Bandwidth
+        // Simple diff logic or raw values? 
+        // The python script saves CUMULATIVE bytes. We need rate?
+        // For now just show total transferred or raw bytes.
+        // Let's show TOTAL for now.
+        document.getElementById('inspUp').innerText = formatBytes(data.upload_bytes);
+        document.getElementById('inspDown').innerText = formatBytes(data.download_bytes);
+
+        // Update Domains
+        const domainList = document.getElementById('inspDomains');
+        if (data.recent_sites && data.recent_sites.length > 0) {
+            domainList.innerHTML = data.recent_sites.map(site => `
+                <div class="domain-item">
+                    <span class="time">${new Date(site.timestamp * 1000).toLocaleTimeString()}</span>
+                    <span class="url" title="${site.url || site.domain}">${site.url || site.domain}</span>
+                </div>
+            `).join('');
+        }
+
+        // Update Images
+        const imageList = document.getElementById('inspImages');
+        if (data.captured_images && data.captured_images.length > 0) {
+            imageList.innerHTML = data.captured_images.map(img => `
+                <div class="media-item" onclick="window.open('/captured_images/${img.filename}', '_blank')">
+                    <img src="/captured_images/${img.filename}" loading="lazy">
+                </div>
+            `).join('');
+        } else {
+            imageList.innerHTML = '<div class="empty-media">No images captured yet. Browse non-secure sites.</div>';
+        }
+
+        // Update Footprint
+        updateFootprint();
+
+    } catch (e) { console.error(e); }
+}
+
+function formatDuration(seconds) {
+    if (!seconds || seconds < 0) return '< 1s';
+    if (seconds < 60) return `${Math.round(seconds)}s`;
+    if (seconds < 3600) return `${Math.floor(seconds / 60)}m ${Math.round(seconds % 60)}s`;
+    return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m`;
+}
+
+async function updateFootprint() {
+    if (!selectedDevice) return;
+    try {
+        const res = await fetch(`/api/footprint?ip=${selectedDevice.ip}`);
+        const fp = await res.json();
+
+        const footprintEl = document.getElementById('inspHistory');
+        if (!footprintEl) return;
+
+        const domains = fp.domains || {};
+        const domainKeys = Object.keys(domains);
+
+        if (domainKeys.length === 0) {
+            footprintEl.innerHTML = '<div class="empty-media">No footprint data yet. Waiting for activity...</div>';
+            return;
+        }
+
+        // Sort by last_seen (most recent first)
+        domainKeys.sort((a, b) => (domains[b].last_seen || 0) - (domains[a].last_seen || 0));
+
+        // Summary stats
+        const totalBytes = fp.total_bytes || 0;
+        const totalDomains = domainKeys.length;
+        const sessions = (fp.sessions || []).length;
+
+        let html = `
+            <div class="fp-summary">
+                <span>📊 <b>${totalDomains}</b> domains</span>
+                <span>💾 <b>${formatBytes(totalBytes)}</b> total</span>
+                <span>📋 <b>${sessions}</b> sessions</span>
+            </div>
+        `;
+
+        html += domainKeys.map(domain => {
+            const d = domains[domain];
+            const duration = d.last_seen && d.first_seen
+                ? formatDuration(d.last_seen - d.first_seen)
+                : '-';
+            const lastSeen = d.last_seen
+                ? new Date(d.last_seen * 1000).toLocaleTimeString()
+                : '-';
+            const bytes = formatBytes(d.bytes_total || 0);
+            const visits = d.visit_count || 0;
+
+            // Show URLs if available
+            let urlsHtml = '';
+            if (d.urls && d.urls.length > 0) {
+                const urlItems = d.urls.slice(0, 3).map(u =>
+                    `<div class="fp-url">${u.url}</div>`
+                ).join('');
+                urlsHtml = `<div class="fp-urls">${urlItems}</div>`;
+            }
+
+            return `
+                <div class="fp-domain-card">
+                    <div class="fp-domain-header">
+                        <span class="fp-domain-name">🌐 ${domain}</span>
+                        <span class="fp-domain-visits">${visits}×</span>
+                    </div>
+                    <div class="fp-domain-stats">
+                        <span>⏱ ${duration}</span>
+                        <span>💾 ${bytes}</span>
+                        <span>🕐 ${lastSeen}</span>
+                    </div>
+                    ${urlsHtml}
+                </div>
+            `;
+        }).join('');
+
+        footprintEl.innerHTML = html;
+    } catch (e) { console.error(e); }
+}
+
+async function stopMitm() {
+    try {
+        await fetch('/api/mitm/stop', { method: 'POST' });
+        clearInterval(inspectorInterval);
+        document.getElementById('inspectorPanel').style.display = 'none';
+        log('Monitoring stopped.');
+    } catch (e) { log('Error stopping MITM'); }
+}
+
+function formatBytes(bytes, decimals = 2) {
+    if (!+bytes) return '0 Bytes';
+    const k = 1024;
+    const dm = decimals < 0 ? 0 : decimals;
+    const sizes = ['Bytes', 'KB', 'MB', 'GB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return `${parseFloat((bytes / Math.pow(k, i)).toFixed(dm))} ${sizes[i]}`;
+}
+
+async function blockInternet() {
+    if (!selectedDevice) return;
+    const ip = selectedDevice.ip;
+    log(`Blocking internet for ${ip}...`);
+    appendToConsole(`> CUTTING CONNECTION TO ${ip}...`);
+
+    try {
+        const res = await fetch('/api/block/start', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ ip })
+        });
+        const data = await res.json();
+        if (data.error) {
+            appendToConsole(`ERROR: ${data.error}`);
+        } else {
+            appendToConsole(`SUCCESS: Target isolated from gateway.`);
+            log(`Block active on ${ip}`);
+        }
+    } catch (e) {
+        appendToConsole(`Connection Error: ${e.message}`);
+    }
+}
+
+async function deepScan() {
+    if (!selectedDevice) return;
+    const ip = selectedDevice.ip;
+    log(`Deep scanning ${ip}...`);
+    appendToConsole(`> RUNNING NMAP-STYLE SCAN ON ${ip}...`);
+    appendToConsole(`> Please wait (approx 10-20s)...`);
+
+    try {
+        const res = await fetch(`/api/inspect?ip=${ip}`);
+        const data = await res.json();
+
+        if (data.error) {
+            appendToConsole(`ERROR: ${data.error}`);
+        } else {
+            const ports = data.ports ? data.ports.join(', ') : 'None';
+            appendToConsole(`SCAN COMPLETE.\nOpen Ports: ${ports}\nOS Hint: ${data.os || 'Unknown'}`);
+            log(`Scan complete for ${ip}`);
+        }
+    } catch (e) {
+        appendToConsole(`Scan Error: ${e.message}`);
+    }
+}
+
+function appendToConsole(text) {
+    const consoleBox = document.getElementById('modalConsole');
+    consoleBox.innerText += '\n' + text;
+    consoleBox.scrollTop = consoleBox.scrollHeight;
+}
+
+// ── LOGGING ───────────────────────────────────────────────────────────────────
+
+function log(msg) {
+    const logBox = document.querySelector('.terminal-window');
+    const entry = document.createElement('div');
+    entry.className = 'log-line';
+    const time = new Date().toLocaleTimeString();
+    entry.innerHTML = `<span class="timestamp">[${time}]</span> ${msg}`;
+
+    // Append to actual log container inside window in index.html
+    const container = document.getElementById('activityLog');
+    if (container) {
+        container.appendChild(entry);
+        if (container.parentElement) container.parentElement.scrollTop = container.parentElement.scrollHeight;
+    }
+}
+
+
+function clearLogs() {
+    const container = document.getElementById('activityLog');
+    if (container) container.innerHTML = '';
+}
+
+// ── GLOBAL FOOTPRINT VIEW ─────────────────────────────────────────────────────
+async function renderGlobalFootprint() {
+    const container = document.getElementById('footprintContainer');
+    if (!container) return;
+
+    container.innerHTML = '<div class="empty-state">Loading network history...</div>';
+
+    try {
+        const res = await fetch('/api/footprint');
+        const db = await res.json();
+        const devices = Object.keys(db);
+
+        if (devices.length === 0) {
+            container.innerHTML = '<div class="empty-state">No network history recorded yet.</div>';
+            return;
+        }
+
+        // Sort by total bytes (most active top)
+        devices.sort((a, b) => (db[b].total_bytes || 0) - (db[a].total_bytes || 0));
+
+        let html = '';
+
+        devices.forEach(ip => {
+            const data = db[ip];
+            const domains = data.domains || {};
+            const domainKeys = Object.keys(domains);
+
+            // Sort domains by visits
+            domainKeys.sort((a, b) => (domains[b].visit_count || 0) - (domains[a].visit_count || 0));
+            const topDomains = domainKeys.slice(0, 5);
+
+            html += `
+                <div class="device-card" style="cursor: default;">
+                    <div class="header" onclick="this.nextElementSibling.style.display = this.nextElementSibling.style.display === 'none' ? 'block' : 'none'" style="cursor: pointer;">
+                        <div class="ip-badge">${ip}</div>
+                        <div class="device-details">
+                            <h3>${data.hostname || 'Unknown Device'}</h3>
+                            <p>${domainKeys.length} domains • ${formatBytes(data.total_bytes)} • Last seen ${new Date((data.last_seen || 0) * 1000).toLocaleTimeString()}</p>
+                        </div>
+                        <div class="device-icon">▼</div>
+                    </div>
+                    
+                    <div class="fp-details" style="display:none; padding-top:15px; border-top:1px solid rgba(255,255,255,0.1); margin-top:10px;">
+                        ${domainKeys.length > 0 ? domainKeys.map(d => {
+                const domain = domains[d];
+                return `
+                                <div class="fp-domain-card">
+                                    <div class="fp-domain-header">
+                                        <span class="fp-domain-name">🌐 ${d}</span>
+                                        <span class="fp-domain-visits">${domain.visit_count}×</span>
+                                    </div>
+                                    <div class="fp-domain-stats">
+                                        <span>⏱ ${formatDuration((domain.last_seen || 0) - (domain.first_seen || 0))}</span>
+                                        <span>💾 ${formatBytes(domain.bytes_total)}</span>
+                                    </div>
+                                </div>
+                            `;
+            }).join('') : '<div class="empty-media">No domains recorded.</div>'}
+                        
+                        <div style="margin-top:10px; text-align:right;">
+                            <span class="btn btn-secondary" onclick="window.open('/api/footprint?ip=${ip}', '_blank')" style="font-size:10px;">VIEW RAW JSON</span>
+                        </div>
+                    </div>
+                </div>
+            `;
+        });
+
+        container.innerHTML = html;
+
+    } catch (e) {
+        console.error(e);
+        container.innerHTML = `<div class="empty-state">Error loading footprint: ${e.message}</div>`;
+    }
+}

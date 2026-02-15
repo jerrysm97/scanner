@@ -29,7 +29,7 @@ const fs = require('fs'); // Added fs
 const path = require('path');
 const net = require('net');
 const dns = require('dns');
-const { exec } = require('child_process');
+const { exec, spawn } = require('child_process');
 const macLookup = require('mac-lookup');
 const { createClient } = require('@supabase/supabase-js');
 
@@ -55,14 +55,16 @@ const supabase = (SUPABASE_URL && SUPABASE_KEY)
 const app = express();
 
 // Security headers — configured to allow web frontend assets
+// Security headers — configured to allow web frontend assets
 app.use(helmet({
     contentSecurityPolicy: {
         directives: {
             defaultSrc: ["'self'"],
-            scriptSrc: ["'self'"],
+            scriptSrc: ["'self'", "'unsafe-inline'"],
+            scriptSrcAttr: ["'unsafe-inline'"],
             styleSrc: ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com"],
             fontSrc: ["'self'", "https://fonts.gstatic.com", "data:"],
-            imgSrc: ["'self'", "data:"],
+            imgSrc: ["'self'", "data:", "blob:"], // Added blob:
             connectSrc: ["'self'"],
         }
     }
@@ -76,17 +78,19 @@ app.use(express.json());
 
 // Serve web frontend
 app.use(express.static(path.join(__dirname, 'public')));
+// Serve captured images directory
+app.use('/captured_images', express.static(path.join(__dirname, '..', 'captured_images')));
 
 // Request logging with timestamps
 app.use(morgan(':date[iso] :method :url :status :response-time ms'));
 
-// Rate limiting — 100 requests per 15 minutes per IP
+// Rate limiting — 1000 requests per 15 minutes per IP (generous for local tool)
 const apiLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
-    max: 100,
+    max: 1000,
     standardHeaders: true,
     legacyHeaders: false,
-    message: { error: 'Too many requests. Please wait 15 minutes.' },
+    message: { error: 'Too many requests. Please wait a moment.' },
 });
 app.use('/api/', apiLimiter);
 
@@ -97,6 +101,17 @@ app.use('/api/', apiLimiter);
 const IS_ROOT = process.getuid ? process.getuid() === 0 : false;
 const honeypotLogs = [];
 let totalDevicesLogged = 0;
+let savedTargets = {};
+
+// Load saved targets
+const targetsFile = path.join(__dirname, 'targets.json');
+if (fs.existsSync(targetsFile)) {
+    try {
+        savedTargets = JSON.parse(fs.readFileSync(targetsFile, 'utf8'));
+    } catch (e) {
+        console.error('Failed to load targets.json:', e);
+    }
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  STARTUP BANNER
@@ -406,7 +421,9 @@ app.get('/health', (req, res) => {
 app.get('/api/scan', (req, res) => {
     console.log('📡 Scan requested...');
 
-    exec('python3 ../agent.py', { timeout: 120000 }, async (error, stdout, stderr) => {
+    const agentPath = path.join(__dirname, '../agent.py');
+
+    exec(`python3 "${agentPath}"`, { timeout: 120000 }, async (error, stdout, stderr) => {
         if (stderr) console.log('Agent:', stderr.trim());
 
         if (error) {
@@ -428,7 +445,8 @@ app.get('/api/scan', (req, res) => {
 
                     const vendor = await lookupVendor(device.mac);
                     const hostname = await resolveHostname(device.ip);
-                    return { ...device, vendor, type: classifyDevice(vendor, device.mac), hostname };
+                    const customName = savedTargets[device.mac] || null;
+                    return { ...device, vendor, type: classifyDevice(vendor, device.mac), hostname, name: customName };
                 })
             );
 
@@ -474,7 +492,8 @@ app.get('/api/inspect', (req, res) => {
 
     console.log(`🔍 Deep scan: ${targetIP}`);
 
-    exec(`python3 ../agent.py ${targetIP}`, { timeout: 60000 }, (error, stdout, stderr) => {
+    const agentPath = path.join(__dirname, '../agent.py');
+    exec(`python3 "${agentPath}" ${targetIP}`, { timeout: 60000 }, (error, stdout, stderr) => {
         if (stderr) console.log('Agent:', stderr.trim());
         if (error) return res.status(500).json({ error: error.message });
 
@@ -497,7 +516,8 @@ app.get('/api/audit', (req, res) => {
 
     console.log(`🔐 Credential audit: ${targetIP}`);
 
-    exec(`python3 ../agent.py audit ${targetIP}`, { timeout: 30000 }, (error, stdout, stderr) => {
+    const agentPath = path.join(__dirname, '../agent.py');
+    exec(`python3 "${agentPath}" audit ${targetIP}`, { timeout: 30000 }, (error, stdout, stderr) => {
         if (stderr) console.log('Agent:', stderr.trim());
         if (error) return res.status(500).json({ error: error.message });
 
@@ -540,6 +560,21 @@ app.get('/api/device-history', async (req, res) => {
         res.json({ mac, history: data || [] });
     } catch (err) {
         res.status(500).json({ error: err.message });
+    }
+});
+
+// ── Rename Device (Persistence) ───────────────────────────────────────────────
+app.post('/api/device/rename', (req, res) => {
+    const { mac, name } = req.body;
+    if (!mac || !name) return res.status(400).json({ error: 'MAC and Name required' });
+
+    savedTargets[mac] = name;
+
+    try {
+        fs.writeFileSync(targetsFile, JSON.stringify(savedTargets, null, 2));
+        res.json({ status: 'success', mac, name });
+    } catch (e) {
+        res.status(500).json({ error: 'Failed to save targets.json' });
     }
 });
 
@@ -622,7 +657,9 @@ app.get('/api/traffic', (req, res) => {
 
 // ── MitM / Traffic Monitor API ──────────────────────────────────────────────
 
-let activeMitmProcess = null;
+// Multi-device monitoring: { "192.168.1.72": process, "192.168.1.65": process }
+let activeMonitors = {};
+let passiveMonitorProcess = null;
 
 /**
  * Get active network interface (auto-detect for macOS & Linux)
@@ -630,7 +667,6 @@ let activeMitmProcess = null;
 function getNetworkInterface() {
     const { networkInterfaces } = require('os');
     const nets = networkInterfaces();
-    // Prefer common interface names
     const preferred = ['wlan0', 'en0', 'eth0', 'wlp2s0', 'enp0s3', 'Wi-Fi'];
     for (const name of preferred) {
         if (nets[name]) {
@@ -638,7 +674,6 @@ function getNetworkInterface() {
             if (hasIPv4) return name;
         }
     }
-    // Fallback: first non-internal IPv4 interface
     for (const [name, addrs] of Object.entries(nets)) {
         if (addrs.some(n => n.family === 'IPv4' && !n.internal)) return name;
     }
@@ -649,11 +684,10 @@ function getNetworkInterface() {
  * Get Default Gateway IP
  */
 function getGatewayIP() {
-    return new Promise((resolve, reject) => {
+    return new Promise((resolve) => {
         const cmd = process.platform === 'darwin'
             ? "netstat -nr | grep default | awk '{print $2}' | head -n 1"
             : "ip route | grep default | awk '{print $3}'";
-
         exec(cmd, (err, stdout) => {
             if (err || !stdout) return resolve(null);
             resolve(stdout.trim());
@@ -662,155 +696,210 @@ function getGatewayIP() {
 }
 
 /**
- * Start MitM Monitoring for a specific target
+ * Start Passive DNS Monitor (auto-starts on server boot)
  */
+function startPassiveMonitor() {
+    if (passiveMonitorProcess) {
+        console.log('⚠️  Passive monitor already running.');
+        return;
+    }
+    const scriptPath = path.join(__dirname, '..', 'passive_monitor.py');
+    if (!fs.existsSync(scriptPath)) {
+        console.log('⚠️  passive_monitor.py not found, skipping.');
+        return;
+    }
+
+    const iface = getNetworkInterface();
+    console.log(`📡 Starting passive DNS monitor on ${iface}...`);
+
+    const cmd = 'python3';
+    const args = [scriptPath, '-i', iface];
+
+    passiveMonitorProcess = spawn(cmd, args, {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        cwd: path.join(__dirname, '..')
+    });
+
+    passiveMonitorProcess.stdout.on('data', (data) => {
+        const msg = data.toString().trim();
+        if (msg) console.log(`[Passive] ${msg}`);
+    });
+    passiveMonitorProcess.stderr.on('data', (data) => {
+        const msg = data.toString().trim();
+        if (msg && !msg.includes('WARNING')) console.error(`[Passive ERR] ${msg}`);
+    });
+    passiveMonitorProcess.on('exit', (code) => {
+        console.log(`[Passive] Process exited: ${code}`);
+        passiveMonitorProcess = null;
+    });
+}
+
+// ── MITM: Start Targeted Monitoring ────────────────────────────────────────────
 app.post('/api/mitm/start', async (req, res) => {
     const { ip, duration } = req.body;
     if (!ip) return res.status(400).json({ error: 'Target IP required' });
 
-    if (activeMitmProcess) {
-        return res.status(409).json({ error: 'Monitoring already active. Stop it first.' });
+    // If already monitoring this IP, return success
+    if (activeMonitors[ip]) {
+        return res.json({ status: 'already_monitoring', target: ip });
     }
 
+    // Start monitoring for this specific IP
     const gateway = await getGatewayIP();
-    if (!gateway) {
-        return res.status(500).json({ error: 'Could not detect Default Gateway IP' });
-    }
+    if (!gateway) return res.status(500).json({ error: 'Gateway not found' });
 
-    // Path to python script (assuming it's in parent dir relative to Backend/server.js)
     const scriptPath = path.join(__dirname, '..', 'traffic_monitor.py');
-
-    // Check if sudo is needed (it is, but we assume server runs with sudo OR user has set up passwordless sudo)
-    // We will just run "sudo python3 ..." and hope for the best or assume user runs node with sudo.
-    // If not running as root, this might fail or ask for password (which fails in background).
-    // The user instruction said "You will need to restart the server with sudo afterwards".
-
     const iface = getNetworkInterface();
-    console.log(`[MitM] Starting monitor for Target: ${ip}, Gateway: ${gateway}, Interface: ${iface}`);
 
-    const spawn = require('child_process').spawn;
-    const isRoot = process.getuid && process.getuid() === 0;
+    console.log(`😈 Starting MITM on ${ip} via ${gateway}...`);
 
-    // Command: if root, just "python3", else "sudo python3"
-    const cmd = isRoot ? 'python3' : 'sudo';
-    const args = isRoot
-        ? [scriptPath, '-t', ip, '-g', gateway, '-i', iface, '--action', 'monitor']
-        : ['python3', scriptPath, '-t', ip, '-g', gateway, '-i', iface, '--action', 'monitor'];
+    const cmd = 'python3';
+    const args = [scriptPath, '-t', ip, '-g', gateway, '-i', iface, '--action', 'monitor'];
 
-    activeMitmProcess = spawn(cmd, args, {
-        stdio: 'inherit' // Pipe output to console so we can see logs
+    const proc = spawn(cmd, args, {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        cwd: path.join(__dirname, '..')
     });
 
-    activeMitmProcess.on('error', (err) => {
-        console.error(`[MitM] Failed to start process: ${err.message}`);
-        activeMitmProcess = null;
+    proc.stdout.on('data', (data) => {
+        console.log(`[MITM ${ip}] ${data.toString().trim()}`);
+    });
+    proc.stderr.on('data', (data) => {
+        const msg = data.toString().trim();
+        if (msg && !msg.includes('WARNING')) console.error(`[MITM ${ip} ERR] ${msg}`);
+    });
+    proc.on('exit', (code) => {
+        console.log(`[MITM ${ip}] Process exited: ${code}`);
+        delete activeMonitors[ip];
     });
 
-    activeMitmProcess.on('exit', (code) => {
-        console.log(`[MitM] Process exited with code ${code}`);
-        activeMitmProcess = null;
-    });
-
-    res.json({ status: 'started', target: ip, gateway, mode: isRoot ? 'root' : 'sudo' });
+    activeMonitors[ip] = proc;
+    res.json({ status: 'started', target: ip, gateway, active_monitors: Object.keys(activeMonitors) });
 });
 
-/**
- * Stop MitM Monitoring
- */
+// ── MITM: Stop (single target or all) ─────────────────────────────────────────
 app.post('/api/mitm/stop', (req, res) => {
-    if (activeMitmProcess) {
-        // Send SIGTERM to python script
-        // Note: sudo might mask the signal, so we might need to run sudo kill.
-        // But spawn('sudo'...) means activeMitmProcess.kill() kills the sudo process.
-        // The python script handles signals, so sudo usually forwards it.
-        // If not, we might need: exec(`sudo pkill -f "python3 .*traffic_monitor.py"`)
+    const { ip } = req.body || {};
 
-        console.log('[MitM] Stopping monitor...');
-        activeMitmProcess.kill('SIGTERM');
+    if (ip && activeMonitors[ip]) {
+        activeMonitors[ip].kill('SIGTERM');
+        delete activeMonitors[ip];
+        return res.json({ status: 'stopped', target: ip });
+    }
 
-        // Fallback: Force kill after 2s if still running
-        setTimeout(() => {
-            if (activeMitmProcess) {
-                exec('sudo pkill -f "traffic_monitor.py"', () => {
-                    activeMitmProcess = null;
-                });
-            }
-        }, 2000);
+    // Stop ALL monitors
+    for (const [targetIp, proc] of Object.entries(activeMonitors)) {
+        try { proc.kill('SIGTERM'); } catch (e) { }
+    }
+    activeMonitors = {};
+    exec('pkill -f "traffic_monitor.py"', () => {
+        res.json({ status: 'all_stopped' });
+    });
+});
 
-        activeMitmProcess = null;
-        res.json({ status: 'stopped' });
+// ── Monitor Status ────────────────────────────────────────────────────────────
+app.get('/api/monitor/status', (req, res) => {
+    const passiveStats = path.join(__dirname, '..', 'passive_stats.json');
+    let passive = null;
+    if (fs.existsSync(passiveStats)) {
+        try { passive = JSON.parse(fs.readFileSync(passiveStats, 'utf8')); } catch { }
+    }
+
+    res.json({
+        active_monitors: Object.keys(activeMonitors),
+        passive_monitor: !!passiveMonitorProcess,
+        passive_stats: passive,
+        monitor_count: Object.keys(activeMonitors).length
+    });
+});
+
+// ── MITM: Details (Traffic Inspector) ─────────────────────────────────────────
+app.get('/api/mitm/details', (req, res) => {
+    const statsFile = path.join(__dirname, '..', 'traffic_stats.json');
+    if (fs.existsSync(statsFile)) {
+        try {
+            const data = JSON.parse(fs.readFileSync(statsFile, 'utf8'));
+            data.active_monitors = Object.keys(activeMonitors);
+            res.json(data);
+        } catch { res.json({ error: 'Stats read error' }); }
     } else {
-        res.json({ status: 'already_stopped' });
+        res.json({ error: 'No stats yet', active_monitors: Object.keys(activeMonitors) });
     }
 });
 
-/**
- * Start Blocking (Deny Internet)
- */
+// ── FOOTPRINT: Per-Device Organized History ───────────────────────────────────
+app.get('/api/footprint', (req, res) => {
+    const footprintFile = path.join(__dirname, '..', 'footprint_db.json');
+    const targetIP = req.query.ip;
+
+    if (fs.existsSync(footprintFile)) {
+        try {
+            const db = JSON.parse(fs.readFileSync(footprintFile, 'utf8'));
+            if (targetIP && db[targetIP]) {
+                res.json({ ip: targetIP, ...db[targetIP] });
+            } else if (targetIP) {
+                res.json({ ip: targetIP, domains: {}, sessions: [], total_bytes: 0 });
+            } else {
+                res.json(db);
+            }
+        } catch (e) {
+            res.status(500).json({ error: 'Footprint read error' });
+        }
+    } else {
+        res.json(targetIP ? { ip: targetIP, domains: {}, sessions: [], total_bytes: 0 } : {});
+    }
+});
+
+// ── BLOCK: Start Blocking (Deny Internet) ─────────────────────────────────────
 app.post('/api/block/start', async (req, res) => {
     const { ip } = req.body;
     if (!ip) return res.status(400).json({ error: 'Target IP required' });
 
-    if (activeMitmProcess) {
-        return res.status(409).json({ error: 'An operation is already active. Stop it first.' });
+    // Kill existing monitor for this IP if any
+    if (activeMonitors[`block_${ip}`]) {
+        try { activeMonitors[`block_${ip}`].kill('SIGTERM'); } catch (e) { }
+        delete activeMonitors[`block_${ip}`];
     }
 
     const gateway = await getGatewayIP();
-    if (!gateway) {
-        return res.status(500).json({ error: 'Could not detect Default Gateway IP' });
-    }
+    if (!gateway) return res.status(500).json({ error: 'Gateway not found' });
 
     const scriptPath = path.join(__dirname, '..', 'traffic_monitor.py');
     const iface = getNetworkInterface();
-    console.log(`[Block] Starting BLOCK for Target: ${ip}, Gateway: ${gateway}, Interface: ${iface}`);
+    console.log(`🚫 Blocking ${ip} via ${gateway}...`);
 
-    const spawn = require('child_process').spawn;
-    const isRoot = process.getuid && process.getuid() === 0;
-    const cmd = isRoot ? 'python3' : 'sudo';
-    const args = isRoot
-        ? [scriptPath, '-t', ip, '-g', gateway, '-i', iface, '--action', 'block']
-        : ['python3', scriptPath, '-t', ip, '-g', gateway, '-i', iface, '--action', 'block'];
+    const cmd = 'python3';
+    const args = [scriptPath, '-t', ip, '-g', gateway, '-i', iface, '--action', 'block'];
 
-    activeMitmProcess = spawn(cmd, args, {
-        stdio: 'inherit'
+    const proc = spawn(cmd, args, {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        cwd: path.join(__dirname, '..')
+    });
+    proc.on('exit', (code) => {
+        console.log(`[Block ${ip}] Exited: ${code}`);
+        delete activeMonitors[`block_${ip}`];
     });
 
-    activeMitmProcess.on('error', (err) => {
-        console.error(`[Block] Failed to start process: ${err.message}`);
-        activeMitmProcess = null;
-    });
-
-    activeMitmProcess.on('exit', (code) => {
-        console.log(`[Block] Process exited with code ${code}`);
-        activeMitmProcess = null;
-    });
-
+    activeMonitors[`block_${ip}`] = proc;
     res.json({ status: 'blocking_started', target: ip });
 });
 
-/**
- * Stop Blocking (Same as MitM Stop)
- */
+// ── BLOCK: Stop ───────────────────────────────────────────────────────────────
 app.post('/api/block/stop', (req, res) => {
-    // Reuse the same logic since we track the process in the same variable
-    if (activeMitmProcess) {
-        console.log('[Block] Stopping block...');
-        activeMitmProcess.kill('SIGTERM');
-
-        // Fallback
-        setTimeout(() => {
-            if (activeMitmProcess) {
-                exec('sudo pkill -f "traffic_monitor.py"', () => {
-                    activeMitmProcess = null;
-                });
-            }
-        }, 2000);
-
-        activeMitmProcess = null;
-        res.json({ status: 'stopped' });
-    } else {
-        res.json({ status: 'already_stopped' });
+    const { ip } = req.body || {};
+    if (ip && activeMonitors[`block_${ip}`]) {
+        activeMonitors[`block_${ip}`].kill('SIGTERM');
+        delete activeMonitors[`block_${ip}`];
+        return res.json({ status: 'stopped', target: ip });
     }
+    // Stop all blockers
+    for (const key of Object.keys(activeMonitors)) {
+        if (key.startsWith('block_')) {
+            try { activeMonitors[key].kill('SIGTERM'); } catch (e) { }
+            delete activeMonitors[key];
+        }
+    }
+    res.json({ status: 'all_blocks_stopped' });
 });
 
 /**
@@ -853,7 +942,6 @@ app.get('/api/status', async (req, res) => {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 app.listen(PORT, '0.0.0.0', () => {
-    // Get local IP for display
     const { networkInterfaces } = require('os');
     const nets = networkInterfaces();
     let localIP = 'localhost';
@@ -871,4 +959,12 @@ app.listen(PORT, '0.0.0.0', () => {
     console.log(`   → Phone:    http://${localIP}:${PORT}`);
     console.log(`   → Emulator: http://10.0.2.2:${PORT}`);
     console.log(`   → Local:    http://localhost:${PORT}\n`);
+
+    // Auto-start passive DNS monitor
+    const IS_ROOT = process.getuid && process.getuid() === 0;
+    if (IS_ROOT) {
+        startPassiveMonitor();
+    } else {
+        console.log('⚠️  Not root — passive DNS monitor requires sudo. Run: sudo node Backend/server.js');
+    }
 });

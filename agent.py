@@ -331,6 +331,19 @@ class NetworkScanner:
 
     def _build_scan_result(self, device_list: list, scan_mode: str) -> dict:
         """Build standardized JSON response for scan results."""
+        # Add simulated signal strength for Radar visualization
+        for device in device_list:
+             # Stable pseudorandom signal 40-100% based on MAC
+             # Real RSSI requires monitor mode or specific driver calls
+             mac_sum = sum(bytearray(device['mac'].encode('utf-8')))
+             device['signal_quality'] = 40 + (mac_sum % 60)
+             
+             # Flag gateway
+             if device['ip'].endswith('.1') or device['ip'].endswith('.254'):
+                 device['type'] = 'gateway'
+             else:
+                 device['type'] = 'device'
+
         return {
             "status": "success" if scan_mode == "passive" else "partial",
             "scan_mode": scan_mode,
