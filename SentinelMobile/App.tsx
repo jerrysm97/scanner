@@ -89,7 +89,7 @@ const STORAGE_KEYS = {
   DEVICES: '@sentinel_devices',
 };
 
-const DEFAULT_SERVER = 'http://192.168.1.103:3000';
+const API_URL = "http://192.168.1.102:3000";
 const SCREEN_WIDTH = Dimensions.get('window').width;
 
 // ═══════════════════════════════════════════════════════════════════════════════

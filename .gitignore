@@ -22,6 +22,11 @@ __pycache__/
 # Logs
 *.log
 
+
+# Data
+*.json
+*.zip
+
 # APK/IPA
 *.apk
 *.ipa
